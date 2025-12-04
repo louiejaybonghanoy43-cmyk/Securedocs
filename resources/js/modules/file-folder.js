@@ -1,0 +1,5935 @@
+// Contains core logic for file and folder management.
+
+/**
+ * Functions to move here from dashboard.js:
+ * - handleCreateFolder()
+ * - navigateToFolder()
+ * - renderFiles()
+ * - renderPagination()
+ * - deleteItem()
+ * - restoreItem
+ * - forceDeleteItem
+ * - loadUserFiles
+ */
+
+
+// Import UI functions
+import { showNotification, escapeHtml, initializeTooltips, formatFileSize, updateBreadcrumbsDisplay } from './ui.js';
+
+// Module-level state
+let state = {
+    currentPage: 1,
+    lastMainSearch: '',
+    currentParentId: null,
+    breadcrumbs: [],
+    layout: localStorage.getItem('filesLayout') || 'grid',
+    lastItems: [],
+    delegatedListenersBound: false,
+    containerRef: null,
+    processingStatusCache: {},
+    // Selection state
+    selectedItems: new Set(),
+    lastSelectedIndex: -1
+};
+
+// CSRF helper: safely read token from meta or cookie
+function getCsrfToken() {
+    const meta = document.querySelector('meta[name="csrf-token"]');
+    if (meta && meta.content) return meta.content;
+    const match = document.cookie.match(/XSRF-TOKEN=([^;]+)/);
+    return match ? decodeURIComponent(match[1]) : '';
+}
+
+// Processing status helper with simple in-memory cache
+async function getProcessingStatus(fileId) {
+    try {
+        if (state.processingStatusCache && state.processingStatusCache[fileId]) {
+            return state.processingStatusCache[fileId];
+        }
+        const response = await fetch(`/files/${fileId}/processing-status`, {
+            method: 'GET',
+            headers: {
+                'Accept': 'application/json',
+                'X-Requested-With': 'XMLHttpRequest',
+                'X-CSRF-TOKEN': getCsrfToken(),
+                'X-XSRF-TOKEN': getCsrfToken(),
+            },
+            credentials: 'same-origin'
+        });
+        if (!response.ok) {
+            // Best-effort; don't block menu rendering
+            return null;
+        }
+        const data = await response.json().catch(() => null);
+        if (!data) return null;
+        state.processingStatusCache[fileId] = data;
+        return data;
+    } catch (_) {
+        return null;
+    }
+}
+
+// --- Selection Management Functions ---
+
+/**
+ * Clear all selected items and update UI
+ */
+function clearSelection() {
+    state.selectedItems.clear();
+    state.lastSelectedIndex = -1;
+    updateSelectionUI();
+    updateItemVisualStates();
+}
+
+/**
+ * Select all visible items
+ */
+function selectAll() {
+    const container = document.getElementById('filesContainer');
+    if (!container) return;
+
+    // Only select items that are currently visible (not hidden)
+    container.querySelectorAll('[data-item-id]:not([style*="display: none"]):not([style*="display:none"])').forEach(item => {
+        const itemId = item.dataset.itemId;
+        if (itemId) {
+            state.selectedItems.add(itemId);
+        }
+    });
+
+    updateSelectionUI();
+    updateItemVisualStates();
+    showSelectionCountNotification();
+}
+
+/**
+ * Select a range of items from last selected to current item (Shift+click)
+ * @param {string} itemId - The item ID to select to
+ */
+function selectItemRange(itemId) {
+    // Find indices of all visible items
+    const allItems = Array.from(document.querySelectorAll('#filesContainer [data-item-id]'));
+    const startIndex = state.lastSelectedIndex;
+    const endIndex = allItems.findIndex(item => item.dataset.itemId === itemId);
+
+    if (startIndex === -1 || endIndex === -1) {
+        // Fallback to single selection if indices not found
+        toggleItemSelection(itemId, false);
+        return;
+    }
+
+    // Determine range bounds
+    const minIndex = Math.min(startIndex, endIndex);
+    const maxIndex = Math.max(startIndex, endIndex);
+
+    // Clear current selection and select the range
+    state.selectedItems.clear();
+
+    // Add all items in the range to selection
+    for (let i = minIndex; i <= maxIndex; i++) {
+        const itemElement = allItems[i];
+        if (itemElement) {
+            const currentItemId = itemElement.dataset.itemId;
+            if (currentItemId) {
+                state.selectedItems.add(currentItemId);
+            }
+        }
+    }
+
+    // Update last selected index to the clicked item
+    state.lastSelectedIndex = endIndex;
+
+    updateSelectionUI();
+    updateItemVisualStates();
+}
+
+/**
+ * Select/deselect a single item
+ * @param {string} itemId - The item ID to toggle
+ * @param {boolean} addToSelection - If true, add to existing selection (Ctrl+click behavior)
+ */
+function toggleItemSelection(itemId, addToSelection = false) {
+    if (!addToSelection) {
+        // Single selection - clear previous and select this one
+        state.selectedItems.clear();
+    }
+
+    if (state.selectedItems.has(itemId)) {
+        state.selectedItems.delete(itemId);
+    } else {
+        state.selectedItems.add(itemId);
+    }
+
+    // Update last selected index for range selection (future use)
+    const items = Array.from(document.querySelectorAll('#filesContainer [data-item-id]'));
+    const index = items.findIndex(item => item.dataset.itemId === itemId);
+    if (index !== -1) {
+        state.lastSelectedIndex = index;
+    }
+
+    updateSelectionUI();
+    updateItemVisualStates();
+}
+
+/**
+ * Update the selection toolbar visibility and content
+ */
+function updateSelectionUI() {
+    const toolbar = document.getElementById('selectionToolbar');
+    const countElement = document.getElementById('selectionCount');
+    const openBtn = document.getElementById('selectionOpenBtn');
+    const renameBtn = document.getElementById('selectionRenameBtn');
+    const moveBtn = document.getElementById('selectionMoveBtn');
+    const restoreBtn = document.getElementById('selectionRestoreBtn');
+    const deleteBtn = document.getElementById('selectionDeleteBtn');
+    const shareBtn = document.getElementById('selectionShareBtn');
+    const downloadBtn = document.getElementById('selectionDownloadBtn');
+    const deleteLabel = deleteBtn?.querySelector('.btn-label');
+    const container = document.getElementById('filesContainer');
+    const inTrashView = container?.dataset.view === 'trash';
+
+    if (!toolbar || !countElement) return;
+
+    const count = state.selectedItems.size;
+
+    if (count === 0) {
+        toolbar.classList.add('hidden');
+        return;
+    }
+
+    // Update count text
+    const msg = window.I18N.fileFolder.lblSelectedCount.replace(':count', count);
+    countElement.textContent = msg;
+
+    // Show toolbar
+    toolbar.classList.remove('hidden');
+
+    if (inTrashView) {
+        openBtn?.classList.add('hidden');
+        moveBtn?.classList.add('hidden');
+        renameBtn?.classList.add('hidden');
+        shareBtn?.classList.add('hidden');
+        downloadBtn?.classList.add('hidden');
+        restoreBtn?.classList.remove('hidden');
+        if (deleteLabel) deleteLabel.textContent = window.I18N?.fileFolder?.deletePermanently || 'Delete permanently';
+    } else {
+        openBtn?.classList.remove('hidden');
+        moveBtn?.classList.remove('hidden');
+        renameBtn?.classList.remove('hidden');
+        shareBtn?.classList.remove('hidden');
+        downloadBtn?.classList.remove('hidden');
+        restoreBtn?.classList.add('hidden');
+        if (deleteLabel) deleteLabel.textContent = `${window.I18N?.fileFolder?.delete || 'Delete'}`;
+
+        // Disable Open button if multiple items selected (can only open one)
+        if (openBtn) {
+            openBtn.disabled = count > 1;
+        }
+
+        // Disable Rename button if multiple items selected (can only rename one)
+        if (renameBtn) {
+            renameBtn.disabled = count > 1;
+        }
+
+        // Disable Share button if multiple items selected (can only share one at a time)
+        if (shareBtn) {
+            shareBtn.disabled = count > 1;
+        }
+    }
+}
+
+/**
+ * Update visual state of all items based on selection
+ */
+function updateItemVisualStates() {
+    const container = document.getElementById('filesContainer');
+    if (!container) return;
+
+    // Update all item elements
+    container.querySelectorAll('[data-item-id]').forEach(item => {
+        const itemId = item.dataset.itemId;
+        const isSelected = state.selectedItems.has(itemId);
+
+        if (isSelected) {
+            item.classList.add('selected');
+        } else {
+            item.classList.remove('selected');
+        }
+    });
+}
+
+/**
+ * Show notification with selection count
+ */
+function showSelectionCountNotification() {
+    const count = state.selectedItems.size;
+    if (count > 0) {
+        const msg = window.I18N.fileFolder.lblSelectedCount.replace(':count', count);
+        showNotification(msg, 'info');
+    }
+}
+
+/**
+ * Handle item click for selection
+ * @param {Event} event - The click event
+ * @param {string} itemId - The item ID
+ */
+function handleItemClick(event, itemId) {
+    // Don't handle selection if clicking on actions menu button
+    if (event.target.closest('.actions-menu-btn')) {
+        return false; // Let the actions menu handle it
+    }
+
+    // Prevent default browser behavior (text selection, etc.)
+    event.preventDefault();
+    event.stopPropagation();
+
+    // Check modifier keys for different selection behaviors
+    const isMultiSelect = event.ctrlKey || event.metaKey; // Ctrl/Cmd + click
+    const isRangeSelect = event.shiftKey; // Shift + click
+
+    if (isRangeSelect && state.lastSelectedIndex !== -1) {
+        // Shift+click: Select range from last selected item to current item
+        selectItemRange(itemId);
+    } else {
+        // Regular click or Ctrl+click: Toggle single item selection
+        toggleItemSelection(itemId, isMultiSelect);
+    }
+
+    return true; // Selection was handled
+}
+
+/**
+ * Handle keyboard shortcuts for selection
+ */
+function handleKeyboardShortcuts(event) {
+    // Only handle shortcuts when not in an input field
+    if (event.target.tagName === 'INPUT' || event.target.tagName === 'TEXTAREA' || event.target.contentEditable === 'true') {
+        return;
+    }
+
+    const container = document.getElementById('filesContainer');
+    const inTrashView = container?.dataset.view === 'trash';
+
+    if (event.ctrlKey || event.metaKey) {
+        switch (event.key.toLowerCase()) {
+            case 'a':
+                // Ctrl+A: Select all
+                event.preventDefault();
+                selectAll();
+                break;
+        }
+    } else {
+        switch (event.key) {
+            case 'Escape':
+                // Esc: Clear selection
+                event.preventDefault();
+                clearSelection();
+                break;
+            case 'Delete':
+            case 'Backspace':
+                // Delete/Backspace: Delete selected items
+                if (state.selectedItems.size > 0) {
+                    event.preventDefault();
+                    handleSelectionDelete();
+                }
+                break;
+            case 'Enter':
+                // Enter: Open selected item (if single selection)
+                if (state.selectedItems.size === 1) {
+                    event.preventDefault();
+                    handleSelectionOpen();
+                }
+                break;
+        }
+    }
+}
+
+/**
+ * Handle opening selected items from toolbar
+ */
+function handleSelectionOpen() {
+    if (state.selectedItems.size !== 1) return;
+
+    const itemId = Array.from(state.selectedItems)[0];
+    const item = findItemById(itemId);
+
+    if (!item) return;
+
+    if (item.is_folder) {
+        // Navigate to folder
+        navigateToFolder(item.id, item.file_name || item.name);
+    } else {
+        // Preview file
+        handleFilePreview(item.id);
+    }
+
+    clearSelection();
+}
+
+/**
+ * Handle deleting selected items from toolbar
+ */
+async function handleSelectionDelete() {
+    if (state.selectedItems.size === 0) return;
+
+    const container = document.getElementById('filesContainer');
+    const inTrashView = container?.dataset.view === 'trash';
+
+    const confirmMessage = inTrashView ? `${window.I18N?.fileFolder?.deletePermanently || 'Delete permanently?'} ${state.selectedItems.size} ${state.selectedItems.size > 1 ? (window.I18N?.fileFolder?.items || 'items')
+        : (window.I18N?.fileFolder?.item || 'item')}?`
+        : `${window.I18N?.fileFolder?.moveToTrash || 'Move to trash?'} ${state.selectedItems.size} ${state.selectedItems.size > 1 ? (window.I18N?.fileFolder?.items || 'items')
+        : (window.I18N?.fileFolder?.item || 'item')}?`;
+
+    if (!confirm(confirmMessage)) return;
+
+    try {
+        const promises = Array.from(state.selectedItems).map(itemId => {
+            if (inTrashView) {
+                return forceDeleteItem(itemId);
+            } else {
+                return deleteItem(itemId);
+            }
+        });
+
+        await Promise.all(promises);
+
+        showNotification(
+            inTrashView ? window.I18N.fileFolder.msgPermDeleteSuccess : window.I18N.fileFolder.msgDeleteSuccess,
+            'success'
+        );
+
+        clearSelection();
+
+        // Refresh the view
+        if (inTrashView) {
+            loadTrashItems();
+        } else {
+            loadUserFiles(state.lastMainSearch, state.currentPage, state.currentParentId);
+        }
+    } catch (error) {
+        console.error('Error deleting items:', error);
+        showNotification('Error deleting items', 'error');
+    }
+}
+
+/**
+ * Handle moving selected items from toolbar
+ */
+function handleSelectionMove() {
+    if (state.selectedItems.size === 0) return;
+
+    // Check selection limit (50 items max)
+    if (state.selectedItems.size > 50) {
+        showNotification(window.I18N.fileFolder.msgMoveLimit, 'error');
+        return;
+    }
+
+    const itemIds = Array.from(state.selectedItems);
+    showMoveModalMulti(itemIds);
+}
+
+/**
+ * Handle renaming selected item from toolbar
+ */
+function handleSelectionRename() {
+    if (state.selectedItems.size !== 1) return;
+
+    const itemId = Array.from(state.selectedItems)[0];
+    showRenameModal(itemId);
+    clearSelection();
+}
+
+/**
+ * Restore selected items from toolbar
+ */
+async function handleSelectionRestore() {
+    if (state.selectedItems.size === 0) return;
+
+    const container = document.getElementById('filesContainer');
+    const inTrashView = container?.dataset.view === 'trash';
+    const isInsideDeletedFolder = inTrashView && state.currentParentId !== null;
+
+    // Show appropriate confirmation message
+    let confirmMessage = `${window.I18N?.fileFolder?.restore || 'Restore?'} ${state.selectedItems.size} ${state.selectedItems.size > 1 ? (window.I18N?.fileFolder?.items || 'items')
+    : (window.I18N?.fileFolder?.item || 'item')}?`;
+
+    if (isInsideDeletedFolder) {
+        confirmMessage += `\n\n${window.I18N?.fileFolder?.restoreToRoot || 'These items will be restored to the root because their parent folder is deleted.'}`;
+    }
+
+    const confirmed = confirm(confirmMessage);
+    if (!confirmed) return;
+
+    try {
+        // Pass skipDialog=true to avoid showing dialog for each item
+        const promises = Array.from(state.selectedItems).map(itemId => restoreItem(itemId, true));
+        await Promise.all(promises);
+
+        showNotification(window.I18N.fileFolder.msgRestoreSuccess, 'success');
+        clearSelection();
+
+        if (inTrashView) {
+            await loadTrashItemsInFolder(state.currentParentId);
+        } else {
+            await loadUserFiles(state.lastMainSearch, state.currentPage, state.currentParentId);
+        }
+    } catch (error) {
+        console.error('Error restoring items:', error);
+        showNotification('Failed to restore items', 'error');
+    }
+}
+function showCreateFolderModal() {
+    const modal = document.getElementById('createFolderModal');
+    modal?.classList.remove('hidden');
+}
+
+function hideCreateFolderModal() {
+    const modal = document.getElementById('createFolderModal');
+    modal?.classList.add('hidden');
+}
+
+function hideNewDropdown() {
+    const dd = document.getElementById('newDropdown');
+    if (!dd) return;
+    dd.classList.add( 'opacity-0', 'invisible', 'translate-y-[-10px]');
+}
+
+// Main initializer for this module
+export function initializeFileFolderManagement(initialState) {
+    // Set initial state
+    state.currentParentId = initialState.currentParentId;
+    // Normalize parent ID: convert 'null' or empty to null, else to number
+    if (state.currentParentId === 'null' || state.currentParentId === '' || typeof state.currentParentId === 'undefined') {
+        state.currentParentId = null;
+    } else if (state.currentParentId !== null) {
+        const parsed = parseInt(state.currentParentId, 10);
+        if (!Number.isNaN(parsed)) state.currentParentId = parsed;
+    }
+    
+    // If at root folder (currentParentId is null), reset breadcrumbs to empty
+    // This prevents stale breadcrumbs from localStorage showing old folder paths
+    if (state.currentParentId === null) {
+        state.breadcrumbs = [];
+    } else {
+        state.breadcrumbs = initialState.breadcrumbs;
+    }
+
+    // Attach event listeners that are managed by this module
+    const createFolderBtn = document.getElementById('create-folder-btn');
+    createFolderBtn?.addEventListener('click', () => {
+        showCreateFolderModal();
+    });
+
+    // Bind the "New -> New Folder" dropdown option
+    const createFolderOption = document.getElementById('createFolderOption');
+    createFolderOption?.addEventListener('click', (e) => {
+        e.preventDefault();
+        hideNewDropdown();
+        showCreateFolderModal();
+    });
+
+    // Bind the "New -> Upload File" dropdown option
+    const uploadFileOption = document.getElementById('uploadFileOption');
+    uploadFileOption?.addEventListener('click', (e) => {
+        e.preventDefault();
+        hideNewDropdown();
+        if (typeof window.showUploadModal === 'function') {
+            window.showUploadModal();
+        } else {
+            showNotification(window.I18N.fileFolder.msgUploadNotInit, 'error');
+        }
+    });
+
+    // Create Folder Modal handlers
+    const createFolderModal = document.getElementById('createFolderModal');
+    const createFolderForm = document.getElementById('createFolderForm');
+    const newFolderNameInput = document.getElementById('newFolderNameInput');
+    const cancelCreateFolderBtn = document.getElementById('cancelCreateFolderBtn');
+    const closeCreateFolderModalBtn = document.getElementById('closeCreateFolderModalBtn');
+
+    createFolderForm?.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const name = (newFolderNameInput?.value || '').trim();
+        if (!name) {
+            showNotification(window.I18N.fileFolder.msgFolderReq, 'error');
+            return;
+        }
+        try {
+            await handleCreateFolder(name);
+            newFolderNameInput.value = '';
+            hideCreateFolderModal();
+        } catch (_) { /* notification already shown in handler */ }
+    });
+
+    cancelCreateFolderBtn?.addEventListener('click', (e) => {
+        e.preventDefault();
+        newFolderNameInput && (newFolderNameInput.value = '');
+        hideCreateFolderModal();
+    });
+
+    closeCreateFolderModalBtn?.addEventListener('click', (e) => {
+        e.preventDefault();
+        newFolderNameInput && (newFolderNameInput.value = '');
+        hideCreateFolderModal();
+    });
+
+    const breadcrumbsContainer = document.getElementById('breadcrumbsContainer');
+    breadcrumbsContainer?.addEventListener('click', (e) => {
+        if (e.target.tagName === 'A' && e.target.dataset.folderId) {
+            e.preventDefault();
+            const folderId = e.target.dataset.folderId === 'null' ? null : e.target.dataset.folderId;
+            const folderName = e.target.textContent;
+            navigateToFolder(folderId, folderName);
+        }
+    });
+
+    // Listen for navigation events from breadcrumb dropdown (ui.js)
+    window.addEventListener('navigate-to-folder', (e) => {
+        const { folderId, folderName } = e.detail;
+        navigateToFolder(folderId, folderName);
+    });
+
+    // Initial breadcrumbs render
+    updateBreadcrumbsDisplay(state.breadcrumbs, 'main');
+
+    // --- Layout toggle (Grid/List) ---
+    const btnGrid = document.getElementById('btnGridLayout');
+    const btnList = document.getElementById('btnListLayout');
+
+    function updateLayoutToggleUI() {
+        if (!btnGrid || !btnList) return;
+        const gridActive = state.layout === 'grid';
+        // Grid button
+        btnGrid.classList.toggle('text-primary', gridActive);
+        btnGrid.classList.toggle('text-text-secondary', !gridActive);
+        btnGrid.setAttribute('aria-pressed', gridActive ? 'true' : 'false');
+        // List button
+        btnList.classList.toggle('text-primary', !gridActive);
+        btnList.classList.toggle('text-text-secondary', gridActive);
+        btnList.setAttribute('aria-pressed', !gridActive ? 'true' : 'false');
+    }
+
+    function setLayout(layout) {
+        state.layout = layout;
+        localStorage.setItem('filesLayout', layout);
+        applyLayoutClasses(layout);
+        
+        // Sync visual state
+        const gridBtn = document.getElementById('btnGridLayout');
+        const listBtn = document.getElementById('btnListLayout');
+        
+        if (gridBtn && listBtn) {
+            gridBtn.classList.remove('active');
+            listBtn.classList.remove('active');
+            
+            if (layout === 'grid') {
+                gridBtn.classList.add('active');
+            } else {
+                listBtn.classList.add('active');
+            }
+        }
+        
+        // Re-render current list without refetching
+        if (Array.isArray(state.lastItems)) {
+            renderFiles(state.lastItems);
+        }
+    }
+
+    btnGrid?.addEventListener('click', (e) => { e.preventDefault(); setLayout('grid'); });
+    btnList?.addEventListener('click', (e) => { e.preventDefault(); setLayout('list'); });
+
+    // Apply initial layout
+    applyLayoutClasses(state.layout);
+    updateLayoutToggleUI();
+    // Bind delegated listeners once to ensure clicks are captured after re-renders
+    bindDelegatedListeners();
+    // Expose debug helpers for manual testing in console
+    if (typeof window !== 'undefined') {
+        window.__files = {
+            deleteItem,
+            restoreItem,
+            forceDeleteItem,
+            loadUserFiles,
+            navigateToFolder,
+            state
+        }
+    }
+
+    // Add this before the closing brace of initializeFileFolderManagement
+    // Sync visual states when module initializes
+    setTimeout(() => {
+        if (typeof syncSidebarVisualState === 'function') {
+            syncSidebarVisualState();
+        }
+        if (typeof syncLayoutVisualState === 'function') {
+            syncLayoutVisualState();
+        }
+    }, 100);
+
+    // Add global keyboard event listener for selection shortcuts
+    document.addEventListener('keydown', handleKeyboardShortcuts);
+
+    // Add click listener to clear selection when clicking empty space
+    document.addEventListener('click', (event) => {
+        // Only clear if clicking on the files container background (not on items)
+        const container = document.getElementById('filesContainer');
+        if (container && container.contains(event.target) && !event.target.closest('[data-item-id]')) {
+            clearSelection();
+        }
+    });
+
+    // Bind toolbar button event listeners
+    const toolbar = document.getElementById('selectionToolbar');
+    if (toolbar) {
+        document.getElementById('selectionOpenBtn')?.addEventListener('click', handleSelectionOpen);
+        document.getElementById('selectionDeleteBtn')?.addEventListener('click', handleSelectionDelete);
+        document.getElementById('selectionRestoreBtn')?.addEventListener('click', handleSelectionRestore);
+        document.getElementById('selectionMoveBtn')?.addEventListener('click', handleSelectionMove);
+        document.getElementById('selectionRenameBtn')?.addEventListener('click', handleSelectionRename);
+        document.getElementById('selectionShareBtn')?.addEventListener('click', handleSelectionShare);
+        document.getElementById('selectionDownloadBtn')?.addEventListener('click', handleSelectionDownload);
+        document.getElementById('selectionClearBtn')?.addEventListener('click', clearSelection);
+    }
+}
+
+async function handleCreateFolder(folderName) {
+    // Coerce parentId to null or number for backend validation
+    let parentId = state.currentParentId;
+    if (parentId === 'null' || parentId === '' || typeof parentId === 'undefined') parentId = null;
+    if (parentId !== null) {
+        const parsed = parseInt(parentId, 10);
+        if (!Number.isNaN(parsed)) parentId = parsed; else parentId = null;
+    }
+    if (!folderName) {
+        showNotification(window.I18N.fileFolder.msgFolderReq, 'error');
+        return;
+    }
+
+    try {
+        console.debug('Creating folder', { parentId, stateCurrent: state.currentParentId });
+        const response = await fetch('/folders', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]').content,
+                'Accept': 'application/json',
+                'X-Requested-With': 'XMLHttpRequest'
+            },
+            credentials: 'same-origin',
+            body: JSON.stringify({ file_name: folderName, parent_id: parentId })
+        });
+
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.message || 'Failed to create folder');
+
+        showNotification(window.I18N.fileFolder.msgFolderCreated, 'success');
+        loadUserFiles(state.lastMainSearch, state.currentPage, state.currentParentId);
+    } catch (error) {
+        console.error('Create folder error:', error);
+        showNotification(error.message, 'error');
+    }
+}
+
+
+export async function loadSharedFiles() {
+    try {
+        showLoadingState();
+        
+        const response = await fetch('/api/shared-with-me', {
+            method: 'GET',
+            headers: {
+                'Accept': 'application/json',
+                'X-Requested-With': 'XMLHttpRequest',
+                'X-CSRF-TOKEN': getCsrfToken()
+            },
+            credentials: 'same-origin'
+        });
+
+        if (!response.ok) {
+            throw new Error('Failed to load shared files');
+        }
+
+        const data = await response.json();
+        
+        if (data.success) {
+            renderSharedFiles(data.shared_files || []);
+            updateBreadcrumbsDisplay([{ id: null, name: 'Shared with Me' }]);
+        } else {
+            throw new Error(data.message || 'Failed to load shared files');
+        }
+    } catch (error) {
+        console.error('Failed to load shared files:', error);
+        showNotification(window.I18N.fileFolder.msgLoadSharedFailed, 'error');
+        renderSharedFiles([]);
+    }
+}
+
+export async function loadTrashItems() {
+    const itemsContainer = document.getElementById('filesContainer');
+    if (!itemsContainer) {
+        console.error('Items container not found');
+        return;
+    }
+
+    try {
+        // Mark container as trash view for context-sensitive actions
+        itemsContainer.dataset.view = 'trash';
+        itemsContainer.innerHTML = '<div class="flex justify-center items-center py-8"><div class="animate-spin rounded-full h-8 w-8 border-b-2 border-primary"></div></div>';
+
+        const response = await fetch('/files/trash', {
+            headers: {
+                'Accept': 'application/json',
+                'X-Requested-With': 'XMLHttpRequest'
+            },
+            credentials: 'same-origin'
+        });
+        if (!response.ok) throw new Error('Failed to fetch trash items');
+
+        const data = await response.json().catch(() => null);
+        console.log('loadTrashItems: API response:', data);
+
+        // Support both legacy array response and { success, data } shape
+        let allItems = [];
+        if (Array.isArray(data)) {
+            allItems = data;
+        } else if (data && Array.isArray(data.data)) {
+            allItems = data.data;
+        } else if (data && data.success && Array.isArray(data.data)) {
+            allItems = data.data;
+        } else if (data && data.items && Array.isArray(data.items)) {
+            allItems = data.items;
+        }
+
+        // Show all deleted items in trash root view (don't filter by parent_id)
+        // When items are deleted, they should appear in trash regardless of their parent folder
+        console.log('loadTrashItems: received', allItems.length, 'items from API');
+        const items = allItems;
+
+        // Reset breadcrumbs for trash root
+        state.breadcrumbs = [];
+        state.currentParentId = null;
+        
+        // Add trash banner at the top if there are items
+        renderTrashBanner(items.length);
+        
+        // Update breadcrumbs display for trash root
+        updateBreadcrumbsDisplay([], 'trash');
+        
+        // Render using the common files renderer
+        renderFiles(items);
+    } catch (error) {
+        console.error('Error loading trash items:', error);
+        itemsContainer.innerHTML = `
+            <div class="p-4 text-center text-text-secondary col-span-full">
+                <p class="mb-2">${window.I18N.fileFolder.errorLoading}</p>
+                <p class="text-xs text-red-500">${escapeHtml(error.message || '')}</p>
+            </div>
+        `;
+    }
+}
+
+/**
+ * Load trash items filtered by parent folder (for navigation inside deleted folders)
+ */
+async function loadTrashItemsInFolder(parentId) {
+    const itemsContainer = document.getElementById('filesContainer');
+    if (!itemsContainer) {
+        console.error('Items container not found');
+        return;
+    }
+
+    // Treat null/undefined parent as trash root and delegate to loadTrashItems()
+    if (parentId === null || parentId === undefined || parentId === 'null') {
+        state.currentParentId = null;
+        state.breadcrumbs = [];
+        await loadTrashItems();
+        return;
+    }
+
+    try {
+        itemsContainer.dataset.view = 'trash';
+        itemsContainer.innerHTML = '<div class="flex justify-center items-center py-8"><div class="animate-spin rounded-full h-8 w-8 border-b-2 border-primary"></div></div>';
+
+        const response = await fetch('/files/trash', {
+            headers: {
+                'Accept': 'application/json',
+                'X-Requested-With': 'XMLHttpRequest'
+            },
+            credentials: 'same-origin'
+        });
+        if (!response.ok) throw new Error('Failed to fetch trash items');
+
+        const data = await response.json().catch(() => null);
+
+        // Support both legacy array response and { success, data } shape
+        let allItems = [];
+        if (Array.isArray(data)) {
+            allItems = data;
+        } else if (data && Array.isArray(data.data)) {
+            allItems = data.data;
+        } else if (data && data.success && Array.isArray(data.data)) {
+            allItems = data.data;
+        } else if (data && data.items && Array.isArray(data.items)) {
+            allItems = data.items;
+        }
+
+        // Filter items by parent_id
+        const items = allItems.filter(item => item.parent_id == parentId);
+
+        // Don't show trash banner when inside a folder
+        renderFiles(items);
+
+        // Ensure breadcrumbs reflect current trash path
+        updateBreadcrumbsDisplay(state.breadcrumbs, 'trash');
+    } catch (error) {
+        console.error('Error loading trash items in folder:', error);
+        itemsContainer.innerHTML = `
+            <div class="p-4 text-center text-text-secondary col-span-full">
+                <p class="mb-2">Error loading trash items. Please try again.</p>
+                <p class="text-xs text-red-500">${escapeHtml(error.message || '')}</p>
+            </div>
+        `;
+    }
+}
+
+/**
+ * Render the trash banner with "Empty trash" button (Google Drive style)
+ */
+function renderTrashBanner(itemCount) {
+    // Remove existing banner if present
+    const existingBanner = document.getElementById('trashBanner');
+    if (existingBanner) {
+        existingBanner.remove();
+    }
+
+    // Only show banner if there are items in trash AND we're in trash view
+    const container = document.getElementById('filesContainer');
+    const inTrashView = container?.dataset.view === 'trash';
+    
+    if (itemCount === 0 || !inTrashView) return;
+
+    const itemsContainer = document.getElementById('filesContainer');
+    if (!itemsContainer) return;
+
+    const banner = document.createElement('div');
+    banner.id = 'trashBanner';
+    banner.className = 'flex items-center justify-between px-6 py-3 mb-4 bg-surface-dark border border-border-light rounded-lg';
+    banner.innerHTML = `
+        <div class="flex items-center gap-2 text-text-secondary text-sm">
+            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+            </svg>
+            <span>${window.I18N?.fileFolder?.trashWarning || 'Items in trash will be deleted forever after 30 days'}</span>
+        </div>
+        <button 
+            id="emptyTrashBtn" 
+            class="px-4 py-2 text-sm font-medium text-white bg-red-600 hover:bg-red-700 rounded-lg transition-colors duration-200 focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-offset-2 focus:ring-offset-surface-dark"
+        >
+            ${window.I18N?.fileFolder?.emptyTrash || 'Empty trash'}
+        </button>
+    `;
+
+    // Insert banner before the files container
+    itemsContainer.parentNode.insertBefore(banner, itemsContainer);
+
+    // Attach event listener to empty trash button
+    const emptyTrashBtn = document.getElementById('emptyTrashBtn');
+    if (emptyTrashBtn) {
+        emptyTrashBtn.addEventListener('click', handleEmptyTrash);
+    }
+}
+
+/**
+ * Handle empty trash action with confirmation
+ */
+async function handleEmptyTrash() {
+    const confirmed = window.confirm(
+        window.I18N?.fileFolder?.emptyTrashConfirm || 'Are you sure you want to permanently delete all items in trash? This action cannot be undone.'
+    );
+
+    if (!confirmed) return;
+
+    const emptyTrashBtn = document.getElementById('emptyTrashBtn');
+    if (!emptyTrashBtn) return;
+
+    // Disable button and show loading state
+    const originalText = emptyTrashBtn.textContent;
+    emptyTrashBtn.disabled = true;
+    emptyTrashBtn.textContent = window.I18N.fileFolder.btnEmptying;
+    emptyTrashBtn.classList.add('opacity-50', 'cursor-not-allowed');
+
+    try {
+        const response = await fetch('/files/trash/empty', {
+            method: 'DELETE',
+            headers: {
+                'Accept': 'application/json',
+                'Content-Type': 'application/json',
+                'X-CSRF-TOKEN': getCsrfToken(),
+                'X-Requested-With': 'XMLHttpRequest'
+            },
+            credentials: 'same-origin'
+        });
+
+        const result = await response.json();
+
+        if (response.ok && result.success) {
+            showNotification(result.message || window.I18N.fileFolder.msgTrashEmptied, 'success');
+            
+            // Remove banner
+            const banner = document.getElementById('trashBanner');
+            if (banner) banner.remove();
+            
+            // Reload trash view to show empty state
+            await loadTrashItems();
+        } else {
+            throw new Error(result.message || window.I18N.fileFolder.msgTrashEmptyFailed);
+        }
+    } catch (error) {
+        console.error('Error emptying trash:', error);
+        showNotification(error.message || window.I18N.fileFolder.msgTrashEmptyFailed, 'error');
+
+        // Re-enable button
+        emptyTrashBtn.disabled = false;
+        emptyTrashBtn.textContent = originalText;
+        emptyTrashBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+    }
+}
+
+
+function navigateToFolder(folderId, folderName) {
+    const container = document.getElementById('filesContainer');
+    const inTrashView = container?.dataset.view === 'trash';
+
+    // Special handling for trash root navigation
+    if (inTrashView && (folderId === 'trash' || folderId === null || folderId === 'null')) {
+        state.currentParentId = null;
+        state.breadcrumbs = [];
+        updateBreadcrumbsDisplay([], 'trash');
+        clearSelection();
+        loadTrashItems();
+        return;
+    }
+
+    // Special handling for My Documents root navigation (folderId = null)
+    if (folderId === null || folderId === 'null') {
+        state.breadcrumbs = [];
+    } else {
+        const existingIndex = state.breadcrumbs.findIndex(crumb => crumb.id == folderId);
+
+        if (existingIndex !== -1) {
+            state.breadcrumbs = state.breadcrumbs.slice(0, existingIndex + 1);
+        } else {
+            state.breadcrumbs.push({ id: folderId, name: folderName });
+        }
+    }
+
+    // Clear selection when navigating to a new folder
+    clearSelection();
+
+    // Normalize folderId to number or null
+    if (folderId === null || folderId === 'null') {
+        state.currentParentId = null;
+    } else {
+        const parsedId = parseInt(folderId, 10);
+        state.currentParentId = Number.isNaN(parsedId) ? folderId : parsedId;
+    }
+    localStorage.setItem('currentParentId', state.currentParentId);
+    document.getElementById('currentFolderId').value = state.currentParentId;
+    localStorage.setItem('breadcrumbs', JSON.stringify(state.breadcrumbs));
+    state.currentPage = 1;
+    state.lastMainSearch = '';
+    document.getElementById('mainSearchInput').value = '';
+
+    // In trash view, load trash items filtered by parent folder
+    if (inTrashView) {
+        loadTrashItemsInFolder(state.currentParentId);
+    } else {
+        loadUserFiles(state.lastMainSearch, state.currentPage, state.currentParentId);
+    }
+    updateBreadcrumbsDisplay(state.breadcrumbs, inTrashView ? 'trash' : 'main');
+}
+
+function getFileIcon(fileName) {
+    if (!fileName) return '📄';
+    const ext = fileName.split('.').pop()?.toLowerCase();
+    const iconMap = {
+        'pdf': '📄',
+        'doc': '📝', 'docx': '📝',
+        'xls': '📊', 'xlsx': '📊',
+        'ppt': '📺', 'pptx': '📺',
+        'jpg': '🖼️', 'jpeg': '🖼️', 'png': '🖼️', 'gif': '🖼️',
+        'mp4': '🎥', 'avi': '🎥', 'mov': '🎥',
+        'mp3': '🎵', 'wav': '🎵',
+        'zip': '📦', 'rar': '📦',
+        'txt': '📄'
+    };
+    return iconMap[ext] || '📄';
+}
+
+function applyLayoutClasses(layout) {
+    const container = document.getElementById('filesContainer');
+    if (!container) return;
+    if (layout === 'list') {
+        container.className = 'grid grid-cols-1 gap-2';
+    } else {
+        container.className = 'grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-4';
+    }
+}
+
+// Bind delegated event listeners once to survive re-renders
+function bindDelegatedListeners() {
+    const container = document.getElementById('filesContainer');
+    if (!container) return;
+    // If Livewire or another render replaced the container element, rebind
+    if (state.containerRef !== container) {
+        state.containerRef = container;
+        state.delegatedListenersBound = false;
+    }
+    if (state.delegatedListenersBound) return;
+    state.delegatedListenersBound = true;
+
+    // Open actions menu (click)
+    container.addEventListener('click', (e) => {
+        const btn = e.target.closest('.actions-menu-btn');
+        if (btn) {
+            e.preventDefault();
+            e.stopPropagation();
+            const itemId = btn.dataset.itemId;
+            console.debug('[actions-menu-btn] click', { itemId });
+            showActionsMenu(btn, itemId);
+        }
+    });
+
+    // Open actions menu (keyboard)
+    container.addEventListener('keydown', (e) => {
+        const btn = e.target.closest('.actions-menu-btn');
+        if (btn && (e.key === 'Enter' || e.key === ' ')) {
+            e.preventDefault();
+            const itemId = btn.dataset.itemId;
+            console.debug('[actions-menu-btn] keydown', { itemId, key: e.key });
+            showActionsMenu(btn, itemId);
+        }
+    });
+
+    // Folder navigation (enabled in Trash view for browsing deleted folders)
+    container.addEventListener('click', (e) => {
+        const inTrashView = (container?.dataset.view === 'trash');
+        
+        // Check if clicking actions menu button - ignore
+        if (e.target.closest('.actions-menu-btn')) return;
+        
+        // Check for folder navigation (works in both normal and trash views)
+        const folder = e.target.closest('[data-folder-nav-id]');
+        if (folder) {
+            const folderId = folder.dataset.folderNavId;
+            const folderName = folder.dataset.folderNavName;
+            console.debug('[folder] navigate click', { folderId, folderName, inTrashView });
+            navigateToFolder(folderId, folderName);
+            return;
+        }
+
+        // Check for file preview (files only, not folders, skip in Trash view)
+        const fileCard = e.target.closest('[data-file-id]');
+        if (fileCard && !inTrashView) {
+            const fileId = fileCard.dataset.fileId;
+            const isFolder = fileCard.dataset.isFolder === 'true';
+            if (!isFolder) {
+                console.debug('[file] preview click', { fileId });
+                // Check if file has OTP protection before allowing preview
+                handleFilePreview(fileId);
+                return;
+            }
+        }
+    });
+}
+
+function createGoogleDriveCard(item) {
+    const isFolder = !!item.is_folder;
+    const name = item.file_name || item.name || 'Untitled';
+    const itemIcon = isFolder ? '📁' : getFileIcon(name);
+    const dateRaw = item.updated_at || item.created_at;
+    let itemDate = '—';
+    if (dateRaw) {
+        const d = new Date(dateRaw);
+        if (!isNaN(d.getTime())) {
+            itemDate = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+        }
+    }
+
+    const cardElement = document.createElement('div');
+    cardElement.className = 'group relative rounded-lg border border-[#4A4D6A] hover:border-[#7C7F96] hover:shadow-lg transition-all duration-200 cursor-pointer file-card';
+    cardElement.classList.add('file-card');
+
+
+    if (isFolder) {
+        cardElement.setAttribute('data-folder-nav-id', item.id);
+        cardElement.setAttribute('data-folder-nav-name', name);
+    } else {
+        cardElement.setAttribute('data-file-id', item.id);
+        cardElement.setAttribute('data-is-folder', 'false');
+    }
+    cardElement.dataset.itemId = item.id;
+    cardElement.dataset.isFolder = isFolder;
+    cardElement.dataset.itemName = name;
+    
+    if (isFolder) {
+        cardElement.dataset.folderNavId = item.id;
+        cardElement.dataset.folderNavName = name;
+    }
+
+    // Accessibility attributes for keyboard navigation
+
+    cardElement.setAttribute('tabindex', '0');
+    cardElement.setAttribute('role', 'button');
+    cardElement.setAttribute('aria-label', `Open ${isFolder ? 'folder' : 'file'} ${name}`);
+
+    cardElement.innerHTML = `
+        <!-- Header with OTP indicator and three-dot menu -->
+        <div class="absolute top-2 left-2 right-2 flex justify-between items-center z-9">
+            <!-- OTP Security Indicator -->
+                ${!isFolder && item.is_confidential ? `
+                <div class="bg-orange-500 text-white p-1 rounded-full" title="${window.I18N?.fileFolder?.delete || 'OTP Protected'}" data-tooltip="${window.I18N?.fileFolder?.delete || 'OTP Protected'}">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+                    </svg>
+                </div>
+            ` : '<div></div>'}
+            
+            <!-- Actions Menu Button -->
+            <button class="actions-menu-btn opacity-0 group-hover:opacity-100 transition-opacity p-1 rounded-full hover:bg-[#4A4D6A]" 
+                    data-item-id="${item.id}" 
+                    title="${window.I18N?.fileFolder?.moreActions || 'More actions'}"
+                    data-tooltip="${window.I18N?.fileFolder?.moreActions || 'More actions'}"
+                    aria-label="More actions"
+                    aria-haspopup="menu"
+                    aria-expanded="false">
+                <svg viewBox="0 0 20 20" class="w-5 h-5 text-gray-300 hover:text-white" fill="currentColor">
+                    <path d="M10 6c.82 0 1.5-.68 1.5-1.5S10.82 3 10 3s-1.5.67-1.5 1.5S9.18 6 10 6zm0 5.5c.82 0 1.5-.68 1.5-1.5s-.68-1.5-1.5-1.5-1.5.68-1.5 1.5.68 1.5 1.5 1.5zm0 5.5c.82 0 1.5-.67 1.5-1.5 0-.82-.68-1.5-1.5-1.5s-1.5.68-1.5 1.5c0 .83.68 1.5 1.5 1.5z"></path>
+                </svg>
+            </button>
+        </div>
+
+    <!-- Main content area -->
+    <div class="p-4">
+        <!-- Single icon here -->
+        <div class="flex items-center justify-center h-16 mb-3">
+            <span class="text-5xl">${itemIcon}</span>
+        </div>
+        
+        <!-- File info -->
+        <div class="space-y-1">
+            <div class="text-sm font-medium text-white truncate" title="${escapeHtml(name)}">
+                ${escapeHtml(name)}
+            </div>
+            <div class="text-xs text-gray-400">
+                ${itemDate}
+            </div>
+            
+            <!-- Arweave Status Badge (for files stored on Arweave) -->
+            ${!isFolder && item.is_blockchain_stored ? `
+                <div class="mt-3 pt-2 border-t border-[#4A4D6A]">
+                    <div class="w-full flex items-center justify-center px-3 py-2 text-xs bg-green-600 text-white rounded-md font-medium">
+                        <svg class="w-4 h-4 mr-2" fill="currentColor" viewBox="0 0 24 24">
+                            <path d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                        </svg>
+                        ${window.I18N?.fileFolder?.storedOnArweave || 'Stored on Arweave'}
+                    </div>
+                </div>
+            ` : ''}
+        </div>
+    </div>
+
+    <!-- Hover overlay for selection -->
+    <div class="absolute inset-0 bg-blue-500 bg-opacity-0 group-hover:bg-opacity-5 transition-all duration-200 pointer-events-none"></div>
+`;
+
+
+    return cardElement;
+}
+
+function createListRow(item) {
+    const isFolder = !!item.is_folder;
+    const name = item.file_name || item.name || 'Untitled';
+    const icon = isFolder ? '📁' : getFileIcon(name);
+    const size = isFolder ? '' : (typeof item.file_size !== 'undefined' ? formatFileSize(parseInt(item.file_size || 0, 10)) : '');
+    const dateRaw = item.updated_at || item.created_at;
+    let itemDate = '';
+    if (dateRaw) {
+        const d = new Date(dateRaw);
+        if (!isNaN(d.getTime())) {
+            itemDate = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+        }
+    }
+
+    const row = document.createElement('div');
+    row.className = 'file-row bg-[#2A2D47] p-3 rounded-lg flex items-center justify-between hover:border-[#6B7280] border border-[#4A4D6A] transition-all cursor-pointer';
+    row.dataset.itemId = item.id;
+    row.dataset.fileId = item.id; // Add this for click handler compatibility
+    row.dataset.isFolder = isFolder;
+    row.dataset.itemName = name;
+    if (isFolder) {
+        row.dataset.folderNavId = item.id;
+        row.dataset.folderNavName = name;
+    }
+
+    row.setAttribute('tabindex', '0');
+    row.setAttribute('role', 'button');
+    row.setAttribute('aria-label', `Open ${isFolder ? 'folder' : 'file'} ${name}`);
+
+    row.innerHTML = `
+        <div class="flex items-center min-w-0">
+            <span class="text-2xl mr-3">${icon}</span>
+            <span class="text-sm text-white truncate" title="${escapeHtml(name)}">${escapeHtml(name)}</span>
+        </div>
+        <div class="flex items-center text-xs text-gray-300 gap-3">
+            ${size ? `<span class="hidden sm:inline">${size}</span>` : ''}
+            ${itemDate ? `<span class="hidden sm:inline">${itemDate}</span>` : ''}
+            <button class="actions-menu-btn p-2 rounded hover:bg-[#4A4D6A]" data-item-id="${item.id}" data-tooltip="More actions" title="More actions" aria-label="More actions">
+                <svg viewBox="0 0 20 20" class="w-5 h-5 text-gray-300 hover:text-white" fill="currentColor">
+                    <path d="M10 6c.82 0 1.5-.68 1.5-1.5S10.82 3 10 3s-1.5.67-1.5 1.5S9.18 6 10 6zm0 5.5c.82 0 1.5-.68 1.5-1.5s-.68-1.5-1.5-1.5-1.5.68-1.5 1.5.68 1.5 1.5 1.5zm0 5.5c.82 0 1.5-.67 1.5-1.5 0-.82-.68-1.5-1.5-1.5s-1.5.68-1.5 1.5c0 .83.68 1.5 1.5 1.5z"></path>
+                </svg>
+            </button>
+        </div>
+    `;
+
+    return row;
+}
+
+function findItemById(itemId) {
+    return state.lastItems?.find(item => item.id == itemId) || null;
+}
+
+export function renderFiles(items) {
+    const container = document.getElementById('filesContainer');
+    if (!container) return;
+
+    // Clear container
+    container.innerHTML = '';
+
+    if (items.length === 0) {
+        container.innerHTML = `<p class="text-gray-400 text-center col-span-full py-10">${window.I18N?.fileFolder?.noFilesFound || 'No files or folders found.'}</p>`;        return;
+    }
+
+    // Persist items to allow re-rendering on layout toggle
+    state.lastItems = items;
+
+    // Ensure container classes reflect current layout
+    applyLayoutClasses(state.layout);
+
+    // Create and append elements based on current layout using DocumentFragment for better performance
+    const useGrid = state.layout !== 'list';
+    const fragment = document.createDocumentFragment();
+    
+    items.forEach(item => {
+        const element = useGrid ? createGoogleDriveCard(item) : createListRow(item);
+        fragment.appendChild(element);
+    });
+    
+    // Single DOM append for all items
+    container.appendChild(fragment);
+
+    // Attach event listeners for actions menu
+    container.querySelectorAll('.actions-menu-btn').forEach(btn => {
+        btn.addEventListener('click', e => {
+            e.stopPropagation();
+            const itemId = e.currentTarget.dataset.itemId;
+            showActionsMenu(e.currentTarget, itemId);
+        });
+        // Open menu via keyboard
+        btn.addEventListener('keydown', e => {
+            if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                const itemId = e.currentTarget.dataset.itemId;
+                showActionsMenu(e.currentTarget, itemId);
+            }
+        });
+    });
+
+    // Attach event listeners for folder navigation (enabled in Trash view for browsing deleted folders)
+    const inTrashView = (container?.dataset.view === 'trash');
+    container.querySelectorAll('[data-folder-nav-id]').forEach(folder => {
+        folder.addEventListener('click', e => {
+            // Handle selection first (works in both normal and trash views)
+            const selectionHandled = handleItemClick(e, folder.dataset.itemId);
+            if (selectionHandled) return; // Selection handled, don't navigate
+            
+            // If no selection was triggered (e.g., double-click), proceed with navigation
+            const folderId = e.currentTarget.dataset.folderNavId;
+            const folderName = e.currentTarget.dataset.folderNavName;
+            navigateToFolder(folderId, folderName);
+        });
+        // Keyboard navigate into folder
+        folder.addEventListener('keydown', e => {
+            if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                const folderId = e.currentTarget.dataset.folderNavId;
+                const folderName = e.currentTarget.dataset.folderNavName;
+                navigateToFolder(folderId, folderName);
+            }
+        });
+    });
+
+    // Attach event listeners for file preview (files only, not folders)
+    container.querySelectorAll('[data-file-id]').forEach(fileCard => {
+        fileCard.addEventListener('click', e => {
+            // Handle selection first
+            const selectionHandled = handleItemClick(e, fileCard.dataset.fileId);
+            if (selectionHandled) return; // Selection handled, don't preview
+            
+            // If no selection was triggered (e.g., double-click), proceed with preview
+            const fileId = fileCard.dataset.fileId;
+            const isFolder = fileCard.dataset.isFolder === 'true';
+            if (!isFolder) {
+                // Check if file has OTP protection before allowing preview
+                handleFilePreview(fileId);
+            }
+        });
+        // Keyboard preview file
+        fileCard.addEventListener('keydown', e => {
+            if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                const fileId = e.currentTarget.dataset.fileId;
+                const isFolder = e.currentTarget.dataset.isFolder === 'true';
+                if (!isFolder) {
+                    handleFilePreview(fileId);
+                }
+            }
+        });
+    });
+
+    // Add double-click handlers for opening items (both files and folders)
+    container.querySelectorAll('[data-item-id]').forEach(item => {
+        item.addEventListener('dblclick', e => {
+            e.preventDefault();
+            e.stopPropagation();
+            
+            const itemId = item.dataset.itemId;
+            const itemData = findItemById(itemId);
+            
+            if (!itemData) return;
+            
+            if (itemData.is_folder) {
+                // Navigate to folder on double-click
+                navigateToFolder(itemId, itemData.file_name || itemData.name);
+            } else {
+                // Preview file on double-click
+                handleFilePreview(itemId);
+            }
+        });
+    });
+}
+
+// Function to close all actions menus (exported for use by other modules)
+export function closeAllActionsMenus() {
+    document.querySelectorAll('.actions-menu').forEach(m => m.remove());
+    document.querySelectorAll('.actions-menu-btn[aria-expanded="true"]').forEach(b => b.setAttribute('aria-expanded', 'false'));
+}
+
+/**
+ * Hide the trash banner when not in trash view
+ */
+export function hideTrashBanner() {
+    const existingBanner = document.getElementById('trashBanner');
+    if (existingBanner) {
+        existingBanner.remove();
+    }
+}
+
+async function showActionsMenu(button, itemId) {
+    // Close any existing menus first
+    closeAllActionsMenus();
+
+    // Get the container to check current view
+    const container = document.getElementById('filesContainer');
+
+    // Create a dark-themed context menu
+    const menu = document.createElement('div');
+    menu.className = 'actions-menu absolute bg-[#1F2235] text-gray-200 rounded-lg shadow-lg border border-[#4A4D6A] py-2 z-50 min-w-[160px] max-h-64 overflow-auto';
+    menu.setAttribute('role', 'menu');
+    // Ensure it stays on top even over modals/popovers
+    menu.style.zIndex = '9999';
+    menu.style.top = '100%';
+    menu.style.bottom = 'auto';
+    menu.style.right = '0';
+    menu.style.left = 'auto';
+    menu.style.pointerEvents = 'auto';
+    
+    const inTrashView = (document.getElementById('filesContainer')?.dataset.view === 'trash');
+    
+    // Find the item data to check vectorization and blockchain status
+    const itemData = findItemById(itemId);
+    // Robust boolean coercion: handle true/false, 1/0, 'true'/'false', '1'/'0'
+    const asBool = (v) => (v === true || v === 1 || v === '1' || v === 'true');
+    const isFolder = asBool(itemData?.is_folder);
+    const isBlockchainStored = asBool(itemData?.is_blockchain_stored);
+    // Align with backend File::isVectorized(): flag true AND vectorized_at not null
+    const isVectorized = asBool(itemData?.is_vectorized) && itemData?.vectorized_at != null;
+    const isDeleted = !!itemData?.deleted_at;
+    
+    // Get OTP status from item data (already available from file list)
+    // Check both is_confidential (file-folder.js) and has_otp_protection (search.js) for compatibility
+    const isOtpEnabled = asBool(itemData?.is_confidential) || asBool(itemData?.has_otp_protection);
+    
+    console.debug('[actions-menu] open', { itemId, inTrashView, isVectorized, isBlockchainStored, isFolder, isDeleted, isOtpEnabled });
+    
+    if (inTrashView) {
+        menu.innerHTML = `
+            <button type="button" class="actions-menu-item w-full text-left px-4 py-2 text-sm text-gray-200 hover:bg-[#2A2D47] hover:text-white flex items-center" data-action="restore" data-item-id="${itemId}" role="menuitem" tabindex="-1" title="${window.I18N?.fileFolder?.restoreAction || 'Restore'}" data-tooltip="${window.I18N?.fileFolder?.restoreAction || 'Restore'}">
+                <svg class="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 10h4l3-3m0 0l3 3m-3-3v12" />
+     
+            </svg>
+                ${window.I18N?.fileFolder?.restoreAction || 'Restore'}
+            </button>
+            <button type="button" class="actions-menu-item w-full text-left px-4 py-2 text-sm text-red-400 hover:bg-[#2A2D47] hover:text-red-300 flex items-center" data-action="force-delete" data-item-id="${itemId}" role="menuitem" tabindex="-1" title="${window.I18N?.fileFolder?.deletePermanently || 'Delete permanently'}" data-tooltip="${window.I18N?.fileFolder?.deletePermanently || 'Delete permanently'}">
+                <svg class="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+    
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path>
+                </svg>
+                ${window.I18N?.fileFolder?.deletePermanently || 'Delete permanently'}
+            </button>
+        `;
+    } else {
+        let menuItems = '';
+        // Add "Open" action
+        if (isFolder) {
+            menuItems += `
+                <button class="actions-menu-item w-full text-left px-4 py-2 text-sm text-blue-400 hover:bg-[#2A2D47] hover:text-blue-300 flex items-center" data-action="open-folder" data-item-id="${itemId}" role="menuitem" tabindex="-1" title="${window.I18N?.fileFolder?.openFolder || 'Open folder'}" data-tooltip="${window.I18N?.fileFolder?.openFolder || 'Open folder'}">
+                    <svg class="w-4 h-4 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+         
+               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7a2 2 0 012-2h4l2 2h6a2 2 0 012 2v7a2 2 0 01-2 2H5a2 2 0 01-2-2V7z" />
+                    </svg>
+                    ${window.I18N?.fileFolder?.open || 'Open'}
+                </button>
+        
+            `;
+        } else {
+            menuItems += `
+                <button class="actions-menu-item w-full text-left px-4 py-2 text-sm text-blue-400 hover:bg-[#2A2D47] hover:text-blue-300 flex items-center" data-action="open" data-item-id="${itemId}" role="menuitem" tabindex="-1" title="${window.I18N?.fileFolder?.openFile || 'Open file'}" data-tooltip="${window.I18N?.fileFolder?.openFile || 'Open file'}">
+                    <svg class="w-4 h-4 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+               
+         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+                    </svg>
+                    ${window.I18N?.fileFolder?.open || 'Open'}
+                </button>
+            `;
+        }
+
+        menuItems += `
+            <button class="actions-menu-item w-full text-left px-4 py-2 text-sm text-gray-200 hover:bg-[#2A2D47] hover:text-white flex items-center" data-action="rename" data-item-id="${itemId}" role="menuitem" tabindex="-1" title="${window.I18N?.fileFolder?.rename || 'Rename'}" data-tooltip="${window.I18N?.fileFolder?.rename || 'Rename'}">
+                <svg class="w-4 h-4 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 
+002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"></path>
+                </svg>
+                ${window.I18N?.fileFolder?.rename || 'Rename'}
+            </button>
+            <button class="actions-menu-item w-full text-left px-4 py-2 text-sm text-gray-200 hover:bg-[#2A2D47] hover:text-white flex items-center" data-action="delete" data-item-id="${itemId}" role="menuitem" tabindex="-1" title="${window.I18N?.fileFolder?.delete || 'Delete'}" data-tooltip="${window.I18N?.fileFolder?.delete ||
+'OTP Protected'}">
+                <svg class="w-4 h-4 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path>
+                </svg>
+                ${window.I18N?.fileFolder?.delete || 'Delete'}
+            </button>
+            <button class="actions-menu-item w-full text-left px-4 py-2 text-sm text-gray-200 hover:bg-[#2A2D47] hover:text-white flex items-center" data-action="move" data-item-id="${itemId}" role="menuitem" tabindex="-1" title="${window.I18N?.fileFolder?.move || 'Move'}" data-tooltip="${window.I18N?.fileFolder?.move || 'Move'}">
+                <svg class="w-4 h-4 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16V4m0 0L3 8m4-4l4 4m6 0v12m0 0l4-4m-4 4l-4-4"></path>
+  
+                </svg>
+                ${window.I18N?.fileFolder?.move || 'Move'}
+            </button>
+        `;
+        // Add Share option (for both files and folders, but not if OTP is enabled on files)
+        if (!isOtpEnabled || isFolder) {
+            menuItems += `
+                <div class="border-t border-[#4A4D6A] my-1"></div>
+                <button class="actions-menu-item w-full text-left px-4 py-2 text-sm text-indigo-400 hover:bg-[#2A2D47] hover:text-indigo-300 flex items-center" data-action="share" data-item-id="${itemId}" role="menuitem" tabindex="-1" title="${window.I18N?.fileFolder?.share || 'Share'}" data-tooltip="${window.I18N?.fileFolder?.share || 'Share'}">
+    
+                <svg class="w-4 h-4 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8.684 13.342C8.886 12.938 9 12.482 9 12c0-.482-.114-.938-.316-1.342m0 2.684a3 3 0 110-2.684m0 2.684l6.632 3.316m-6.632-6l6.632-3.316m0 0a3 3 0 105.367-2.684 3 3 0 00-5.367 2.684zm0 9.316a3 3 0 105.367 2.684 3 3 0 00-5.367-2.684z" />
+                
+                </svg>
+                    ${window.I18N?.fileFolder?.share || 'Share'}
+                </button>
+            `;
+        }
+
+        // Add OTP Security option for files (not folders) - Premium only
+        if (!isFolder) {
+            menuItems += `
+                <div class="border-t border-[#4A4D6A] my-1"></div>
+                <button class="actions-menu-item w-full text-left px-4 py-2 text-sm text-orange-400 hover:bg-[#2A2D47] hover:text-orange-300 flex items-center" data-action="otp-security" data-item-id="${itemId}" role="menuitem" tabindex="-1" title="${window.I18N?.fileFolder?.otpSecurity || 'OTP Security'}" data-tooltip="${window.I18N?.fileFolder?.otpSecurity || 'OTP Security'}">
+      
+              <svg class="w-4 h-4 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+                    </svg>
+        
+            ${window.I18N?.fileFolder?.otpSecurity || 'OTP Security'}
+                </button>
+            `;
+        }
+
+        // Add blockchain transfer options based on current view and storage location
+        if (!isFolder) {
+            const inBlockchainView = (container?.dataset.view === 'blockchain');
+            if (inBlockchainView && isBlockchainStored) {
+                // In blockchain view - add comprehensive blockchain actions
+                menuItems += `
+                    <div class="border-t border-[#4A4D6A] my-1"></div>
+                    <button class="actions-menu-item w-full text-left px-4 py-2 text-sm text-purple-400 hover:bg-[#2A2D47] hover:text-purple-300 flex 
+items-center" data-action="download-from-blockchain" data-item-id="${itemId}" role="menuitem" tabindex="-1" title="${window.I18N?.fileFolder?.downloadFromBlockchain || 'Download to Supabase storage'}" data-tooltip="${window.I18N?.fileFolder?.downloadFromBlockchain || 'Download to Supabase storage'}">
+                        <svg class="w-4 h-4 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M9 19l3 3m0 0l3-3m-3 3V10" />
+     
+                   </svg>
+                        ${window.I18N?.fileFolder?.downloadFromBlockchain || 'Download to Supabase'}
+                    </button>
+                    <button class="actions-menu-item w-full text-left px-4 py-2 text-sm text-blue-400 hover:bg-[#2A2D47] hover:text-blue-300 flex items-center" data-action="view-on-ipfs" data-item-id="${itemId}" role="menuitem" 
+tabindex="-1" title="${window.I18N?.fileFolder?.viewOnIPFS || 'View on IPFS Gateway'}" data-tooltip="${window.I18N?.fileFolder?.viewOnIPFS || 'View on IPFS Gateway'}">
+                        <svg class="w-4 h-4 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+           
+             </svg>
+                        ${window.I18N?.fileFolder?.viewOnIPFS || 'View on IPFS Gateway'}
+                    </button>
+                    <button class="actions-menu-item w-full text-left px-4 py-2 text-sm text-green-400 hover:bg-[#2A2D47] hover:text-green-300 flex items-center" data-action="copy-ipfs-hash" data-item-id="${itemId}" role="menuitem" tabindex="-1" title="${window.I18N?.fileFolder?.copyIPFSHash || 'Copy IPFS Hash'}" data-tooltip="${window.I18N?.fileFolder?.copyIPFSHash || 'Copy IPFS Hash'}">
+                        <svg class="w-4 h-4 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+       
+                 </svg>
+                        ${window.I18N?.fileFolder?.copyIPFSHash || 'Copy IPFS Hash'}
+                    </button>
+                    <button class="actions-menu-item w-full text-left px-4 py-2 text-sm text-yellow-400 hover:bg-[#2A2D47] hover:text-yellow-300 flex items-center" data-action="blockchain-info" data-item-id="${itemId}" role="menuitem" tabindex="-1" title="${window.I18N?.fileFolder?.blockchainInfo || 'Blockchain Information'}" data-tooltip="${window.I18N?.fileFolder?.blockchainInfo || 'Blockchain Information'}">
+                        <svg class="w-4 h-4 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                     
+   </svg>
+                        ${window.I18N?.fileFolder?.blockchainInfo || 'Blockchain Info'}
+                    </button>
+                    <button class="actions-menu-item w-full text-left px-4 py-2 text-sm text-indigo-400 hover:bg-[#2A2D47] hover:text-indigo-300 flex items-center" data-action="share-ipfs-link" data-item-id="${itemId}" role="menuitem" tabindex="-1" title="${window.I18N?.fileFolder?.shareIPFSLink || 'Share IPFS Link'}" data-tooltip="${window.I18N?.fileFolder?.shareIPFSLink || 'Share IPFS Link'}">
+           
+             <svg class="w-4 h-4 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8.684 13.342C8.886 12.938 9 12.482 9 12c0-.482-.114-.938-.316-1.342m0 2.684a3 3 0 110-2.684m0 2.684l6.632 3.316m-6.632-6l6.632-3.316m0 0a3 3 0 105.367-2.684 3 3 0 00-5.367 2.684zm0 9.316a3 3 0 105.367 2.684 3 3 0 00-5.367-2.684z" />
+               
+         </svg>
+                        ${window.I18N?.fileFolder?.shareIPFSLink || 'Share IPFS Link'}
+                    </button>
+                    <button class="actions-menu-item w-full text-left px-4 py-2 text-sm text-cyan-400 hover:bg-[#2A2D47] hover:text-cyan-300 flex items-center" data-action="blockchain-history" data-item-id="${itemId}" role="menuitem" tabindex="-1" title="${window.I18N?.fileFolder?.blockchainHistory || 'View Blockchain History'}" data-tooltip="${window.I18N?.fileFolder?.blockchainHistory || 'View Blockchain History'}">
+    
+                     <svg class="w-4 h-4 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                        </svg>
+   
+                     ${window.I18N?.fileFolder?.blockchainHistory || 'View History'}
+                    </button>
+                    <div class="border-t border-[#4A4D6A] my-1"></div>
+                    <button class="actions-menu-item w-full text-left px-4 py-2 text-sm text-red-400 hover:bg-[#2A2D47] hover:text-red-300 flex items-center" data-action="remove-from-blockchain" data-item-id="${itemId}" role="menuitem" 
+tabindex="-1" title="${window.I18N?.fileFolder?.removeFromBlockchain || 'Remove from blockchain'}" data-tooltip="${window.I18N?.fileFolder?.removeFromBlockchain || 'Remove from blockchain'}">
+                        <svg class="w-4 h-4 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+         
+                </svg>
+                        ${window.I18N?.fileFolder?.removeFromBlockchain || 'Remove from Blockchain'}
+                    </button>
+                `;
+            } else if (!inBlockchainView && !isBlockchainStored && !isOtpEnabled) {
+                // In main view and file is not on blockchain and OTP is not enabled - add upload to Arweave option
+                menuItems += `
+                    <div class="border-t border-[#4A4D6A] my-1"></div>
+               
+     <button class="actions-menu-item w-full text-left px-4 py-2 text-sm text-purple-400 hover:bg-[#2A2D47] hover:text-purple-300 flex items-center" data-action="upload-to-arweave" data-item-id="${itemId}" role="menuitem" tabindex="-1" title="${window.I18N?.fileFolder?.uploadToArweave || 'Upload to Arweave permanently'}" data-tooltip="${window.I18N?.fileFolder?.uploadToArweave || 'Upload to Arweave permanently'}">
+                        <svg class="w-4 h-4 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 
+4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" />
+                        </svg>
+                        ${window.I18N?.fileFolder?.uploadToArweave || 'Upload to Arweave'}
+                    </button>
+                `;
+            }
+        }
+
+        // Add vector database actions for non-folder items (Premium only)
+        if (!isFolder && window.userIsPremium) {
+            if (isVectorized) {
+                console.debug('[DEBUG] Adding vector remove button for item:', itemId, { isVectorized, isFolder });
+                if (!isOtpEnabled || isFolder){
+                    menuItems += `
+                        <div class="border-t border-[#4A4D6A] my-1"></div>
+                        <button class="actions-menu-item w-full text-left px-4 py-2 text-sm text-red-400 hover:bg-[#2A2D47] hover:text-red-300 flex items-center" data-action="remove-from-vector" data-item-id="${itemId}" role="menuitem" tabindex="-1" title="${window.I18N?.fileFolder?.removeFromVector || 'Remove from AI vector database'}" data-tooltip="${window.I18N?.fileFolder?.removeFromVector || 'Remove from AI vector database'}">
+                            <svg class="w-4 h-4 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20 12H4" />
+                        
+    </svg>
+                            ${window.I18N?.fileFolder?.removeFromVector || 'Remove from AI Vector DB'}
+                        </button>
+                    `;
+                }
+            } else if (!isOtpEnabled) {
+                console.debug('[DEBUG] Adding vector add button for item:', itemId, { isVectorized, isFolder });
+                menuItems += `
+                    <div class="border-t border-[#4A4D6A] my-1"></div>
+                    <button class="actions-menu-item w-full text-left px-4 py-2 text-sm text-green-400 hover:bg-[#2A2D47] hover:text-green-300 flex items-center" data-action="add-to-vector" data-item-id="${itemId}" role="menuitem" tabindex="-1" title="${window.I18N?.fileFolder?.shareToAI || 'Share File to A.I.'}" data-tooltip="${window.I18N?.fileFolder?.shareToAI || 'Share File to A.I.'}">
+                        <svg class="w-4 h-4 mr-3" fill="none" stroke="currentColor" 
+                        viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
+                        </svg>
+                        ${window.I18N?.fileFolder?.shareToAI || 'Share File to A.I.'}
+                    </button>
+                `;
+            }
+        } else if (!isFolder && !window.userIsPremium) {
+            // Show upgrade prompt for non-premium users
+            console.debug('[DEBUG] Adding premium upgrade prompt for AI Vector DB');
+            menuItems += `
+                <div class="border-t border-[#4A4D6A] my-1"></div>
+                <button class="actions-menu-item w-full text-left px-4 py-2 text-sm text-yellow-400 hover:bg-[#2A2D47] hover:text-yellow-300 flex items-center opacity-60" onclick="showPremiumUpgradeModal('ai')" role="menuitem" tabindex="-1" title="${window.I18N?.fileFolder?.shareToAI || 'Share File to A.I.'}">
+                    <svg class="w-4 h-4 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+             
+           <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
+                    </svg>
+                    ${window.I18N?.fileFolder?.shareToAI || 'Share File to A.I.'}
+</button>
+            `;
+        } else {
+            console.debug('[DEBUG] NOT adding vector buttons for folder:', itemId, { isVectorized, isFolder });
+        }
+
+        // Add blockchain-specific actions
+        const inBlockchainView = (container?.dataset.view === 'blockchain');
+        if (!isFolder && isBlockchainStored) {
+            // Add permanent storage option if not already permanent and in blockchain view
+            const isPermanentStorage = asBool(itemData?.is_permanent_storage);
+            if (inBlockchainView && !isPermanentStorage) {
+                menuItems += `
+                    <div class="border-t border-[#4A4D6A] my-1"></div>
+                    <button class="actions-menu-item w-full text-left px-4 py-2 text-sm text-purple-400 hover:bg-[#2A2D47] hover:text-purple-300 flex items-center" data-action="enable-permanent-storage" data-item-id="${itemId}" role="menuitem" tabindex="-1" title="${window.I18N?.fileFolder?.enablePermanentStorage || 'Enable permanent storage (undeletable)'}" data-tooltip="${window.I18N?.fileFolder?.enablePermanentStorage || 'Enable permanent storage (undeletable)'}">
+            
+            <svg class="w-4 h-4 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+                        </svg>
+  
+                      ${window.I18N?.fileFolder?.enablePermanentStorage || 'Enable Permanent Storage'}
+                    </button>
+                `;
+            }
+
+            // Add blockchain removal option if not in blockchain view and not permanent
+            if (!inBlockchainView && !isPermanentStorage) {
+                menuItems += `
+                    <div class="border-t border-[#4A4D6A] my-1"></div>
+                   
+     <button class="actions-menu-item w-full text-left px-4 py-2 text-sm text-orange-400 hover:bg-[#2A2D47] hover:text-orange-300 flex items-center" data-action="remove-from-blockchain" data-item-id="${itemId}" role="menuitem" tabindex="-1" title="${window.I18N?.fileFolder?.removeFromBlockchain || 'Remove from blockchain storage'}" data-tooltip="${window.I18N?.fileFolder?.removeFromBlockchain || 'Remove from blockchain storage'}">
+                        <svg class="w-4 h-4 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19.428 15.428a2 2 0 00-1.022-.547l-2.387-.477a6 6 0 00-3.86.517l-.318.158a6 6 0 01-3.86.517L6.05 
+15.21a2 2 0 00-1.806.547M8 4h8l-1 1v5.172a2 2 0 00.586 1.414l5 5c1.26 1.26.367 3.414-1.415 3.414H4.828c-1.782 0-2.674-2.154-1.414-3.414l5-5A2 2 0 009 10.172V5L8 4z" />
+                        </svg>
+                        ${window.I18N?.fileFolder?.removeFromBlockchain || 'Remove from Blockchain'}
+                    </button>
+          
+                `;
+            }
+        }
+
+        menu.innerHTML = menuItems;
+    }
+    
+
+    // Async: check processing status to decide whether to show "Restore vectors"
+    (async () => {
+        try {
+            if (!isFolder && isVectorized) {
+                const status = await getProcessingStatus(itemId);
+                if (status?.vectors_soft_deleted) {
+                    const dividerHtml = inTrashView ? '<div class="border-t border-[#4A4D6A] my-1"></div>' : '';
+                    const restoreBtn = `
+                        ${dividerHtml}
+                        <button class="actions-menu-item w-full text-left px-4 py-2 text-sm text-green-400 hover:bg-[#2A2D47] hover:text-green-300 flex items-center" data-action="restore-vectors" data-item-id="${itemId}" role="menuitem" tabindex="-1" title="${window.I18N.fileFolder.restoreAction} vectors" data-tooltip="${window.I18N.fileFolder.restoreAction} vectors">
+                            <svg class="w-4 h-4 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v6h6M20 20v-6h-6M20 4l-6 6M4 20l6-6" />
+                            </svg>
+                            ${window.I18N.fileFolder.restoreAction} vectors
+                        </button>
+                    `;
+                    menu.insertAdjacentHTML('beforeend', restoreBtn);
+                }
+            }
+        } catch (err) {
+            console.warn('[actions-menu] processing-status check failed', err);
+        }
+    })();
+
+    // Position menu relative to button
+    // Append to body to avoid nesting interactive elements (<button> inside <button>)
+    // and position it using viewport coordinates.
+    try {
+        document.body.appendChild(menu);
+        const btnRect = button.getBoundingClientRect();
+        // Use fixed positioning relative to viewport
+        menu.style.position = 'fixed';
+        // Reset conflicting sides to avoid stretching
+        menu.style.right = 'auto';
+        menu.style.bottom = 'auto';
+        // Initial placement below and right-aligned to the trigger with slight offsets to avoid overlap with trigger
+        const offsetY = 8; // push menu a bit below
+        const offsetX = -4; // nudge left a bit
+        menu.style.top = `${btnRect.bottom + offsetY}px`;
+        menu.style.left = `${btnRect.right + offsetX}px`;
+
+        // Now measure and adjust to keep within viewport and prefer right alignment
+        const menuRect = menu.getBoundingClientRect();
+        const viewportW = window.innerWidth;
+        const viewportH = window.innerHeight;
+
+        // Vertical flip if not enough space below
+        const spaceBelow = viewportH - btnRect.bottom;
+        const spaceAbove = btnRect.top;
+        if (spaceBelow < menuRect.height + 8 && spaceAbove > spaceBelow) {
+            menu.style.top = `${Math.max(8, btnRect.top - menuRect.height)}px`;
+        }
+
+        // Horizontal positioning: right-align to button by default
+        let left = btnRect.right - menuRect.width + offsetX;
+        if (left < 8) left = 8;
+        if (left + menuRect.width > viewportW - 8) {
+            left = Math.max(8, viewportW - menuRect.width - 8);
+        }
+        menu.style.left = `${left}px`;
+    } catch (_) { /* noop */ }
+
+    // Update aria-expanded for the trigger
+    button.setAttribute('aria-expanded', 'true');
+    // Prevent trigger from intercepting clicks while menu is open
+    const prevPointerEvents = button.style.pointerEvents;
+    button.style.pointerEvents = 'none';
+
+    // Focus first menu item for keyboard users
+    const firstItem = menu.querySelector('.actions-menu-item');
+    if (firstItem) {
+        firstItem.focus();
+    }
+
+    // DIAGNOSTIC: Compare all menu buttons to see what's different about delete
+    const allButtons = menu.querySelectorAll('.actions-menu-item');
+    console.debug('[DIAGNOSTIC] Menu buttons comparison:');
+    allButtons.forEach((btn, i) => {
+        const rect = btn.getBoundingClientRect();
+        const computedStyle = window.getComputedStyle(btn);
+        console.debug(`[DIAGNOSTIC] Button ${i}:`, {
+            action: btn.dataset.action,
+            itemId: btn.dataset.itemId,
+            text: btn.textContent.trim(),
+            visible: rect.width > 0 && rect.height > 0,
+            position: { x: rect.x, y: rect.y, w: rect.width, h: rect.height },
+            pointerEvents: computedStyle.pointerEvents,
+            zIndex: computedStyle.zIndex,
+            display: computedStyle.display,
+            opacity: computedStyle.opacity,
+            transform: computedStyle.transform
+        });
+    });
+
+    // DIAGNOSTIC: Add temporary global click logger
+    const globalClickLogger = (e) => {
+        const rect = e.target.getBoundingClientRect();
+        // Safely get className - handle SVG elements and other edge cases
+        let classNameStr = '';
+        if (e.target.className) {
+            if (typeof e.target.className === 'string') {
+                classNameStr = e.target.className.split(' ').join('.');
+            } else if (e.target.className.baseVal) {
+                // SVG element with animated class
+                classNameStr = e.target.className.baseVal.split(' ').join('.');
+            }
+        }
+        console.debug('[DIAGNOSTIC] Global click received:', {
+            target: e.target.tagName + (classNameStr ? '.' + classNameStr : ''),
+            action: e.target.dataset?.action,
+            position: { x: rect.x, y: rect.y, w: rect.width, h: rect.height },
+            clickX: e.clientX,
+            clickY: e.clientY,
+            isInMenu: menu.contains(e.target),
+            targetText: e.target.textContent?.trim().substring(0, 20)
+        });
+    };
+    document.addEventListener('click', globalClickLogger, true);
+    
+    // Clean up global logger after 10 seconds
+    setTimeout(() => {
+        document.removeEventListener('click', globalClickLogger, true);
+        console.debug('[DIAGNOSTIC] Global click logger removed');
+    }, 10000);
+
+    // Unified cleanup helper to close menu and unbind listeners (use function declaration for hoisting)
+    function cleanup() {
+        try { document.removeEventListener('click', onOutsideClick); } catch (_) {}
+        try { document.removeEventListener('keydown', onEsc); } catch (_) {}
+        try { document.removeEventListener('click', globalClickLogger, true); } catch (_) {}
+        try { menu.remove(); } catch (_) {}
+        try { button.setAttribute('aria-expanded', 'false'); } catch (_) {}
+        try { button.style.pointerEvents = prevPointerEvents || ''; } catch (_) {}
+    }
+
+    // Redundant direct listeners on the delete button to bypass delegation issues
+    const deleteBtn = menu.querySelector('.actions-menu-item[data-action="delete"]');
+    if (deleteBtn) {
+        const directHandler = (ev) => {
+            console.debug('[actions-menu-item][direct] event', ev.type, { action: 'delete', itemId: deleteBtn.dataset.itemId });
+            ev.preventDefault();
+            ev.stopPropagation();
+            ev.stopImmediatePropagation?.();
+            const id = deleteBtn.dataset.itemId;
+            console.debug('[diagnostic] invoking deleteItem from direct button handler', { itemId: id });
+            deleteItem(id);
+            cleanup();
+        };
+        deleteBtn.addEventListener('click', directHandler);
+    }
+
+    // Direct listener for move action
+    const moveBtn = menu.querySelector('.actions-menu-item[data-action="move"]');
+    if (moveBtn) {
+        const directMove = (ev) => {
+            console.debug('[actions-menu-item][direct] event', ev.type, { action: 'move', itemId: moveBtn.dataset.itemId });
+            ev.preventDefault();
+            ev.stopPropagation();
+            ev.stopImmediatePropagation?.();
+            const id = moveBtn.dataset.itemId;
+            console.debug('[diagnostic] invoking showMoveModal from direct button handler', { itemId: id });
+            showMoveModal(id);
+            cleanup();
+        };
+        moveBtn.addEventListener('click', directMove);
+    }
+
+    // Direct listener for OTP security action
+    const otpSecurityBtn = menu.querySelector('.actions-menu-item[data-action="otp-security"]');
+    if (otpSecurityBtn) {
+        const directOtpSecurity = async (ev) => {
+            console.debug('[actions-menu-item][direct] event', ev.type, { action: 'otp-security', itemId: otpSecurityBtn.dataset.itemId });
+            ev.preventDefault();
+            ev.stopPropagation();
+            ev.stopImmediatePropagation?.();
+            
+            // Check email verification first
+            try {
+                const response = await fetch('/file-otp/check-access', {
+                    method: 'GET',
+                    headers: {
+                        'Accept': 'application/json',
+                        'X-Requested-With': 'XMLHttpRequest',
+                        'X-CSRF-TOKEN': getCsrfToken()
+                    },
+                    credentials: 'same-origin'
+                });
+                
+                const result = await response.json();
+                
+                if (!result.success || !result.can_use_otp) {
+                    showNotification('Please verify your email address to use OTP security features', 'warning');
+                    cleanup();
+                    return;
+                }
+            } catch (error) {
+                console.error('Failed to check OTP access:', error);
+                showNotification('Failed to check access permissions', 'error');
+                cleanup();
+                return;
+            }
+            
+            const id = otpSecurityBtn.dataset.itemId;
+            console.debug('[diagnostic] invoking showOtpSecurityModal from direct button handler', { itemId: id });
+            showOtpSecurityModal(id);
+            cleanup();
+        };
+        otpSecurityBtn.addEventListener('click', directOtpSecurity);
+    }
+
+    // Direct listener for share action
+    const shareBtn = menu.querySelector('.actions-menu-item[data-action="share"]');
+    if (shareBtn) {
+        const directShare = (ev) => {
+            console.debug('[actions-menu-item][direct] event', ev.type, { action: 'share', itemId: shareBtn.dataset.itemId });
+            ev.preventDefault();
+            ev.stopPropagation();
+            ev.stopImmediatePropagation?.();
+            const id = shareBtn.dataset.itemId;
+            showShareModal(id);
+            cleanup();
+        };
+        shareBtn.addEventListener('click', directShare);
+    }
+
+    // Direct listeners for restore and force-delete in Trash view
+    const restoreBtn = menu.querySelector('.actions-menu-item[data-action="restore"]');
+    if (restoreBtn) {
+        const directRestore = (ev) => {
+            console.debug('[actions-menu-item][direct] event', ev.type, { action: 'restore', itemId: restoreBtn.dataset.itemId });
+            ev.preventDefault();
+            ev.stopPropagation();
+            ev.stopImmediatePropagation?.();
+            const id = restoreBtn.dataset.itemId;
+            if (window.confirm(window.I18N.fileFolder.restore + '?')) {
+                console.debug('[diagnostic] invoking restoreItem from direct button handler', { itemId: id });
+                restoreItem(id);
+            }
+            cleanup();
+        };
+        restoreBtn.addEventListener('click', directRestore);
+    }
+
+    const forceBtn = menu.querySelector('.actions-menu-item[data-action="force-delete"]');
+    if (forceBtn) {
+        const directForce = (ev) => {
+            console.debug('[actions-menu-item][direct] event', ev.type, { action: 'force-delete', itemId: forceBtn.dataset.itemId });
+            ev.preventDefault();
+            ev.stopPropagation();
+            ev.stopImmediatePropagation?.();
+            const id = forceBtn.dataset.itemId;
+            if (window.confirm(window.I18N.fileFolder.confirmDeletePerm)) {
+                console.debug('[diagnostic] invoking forceDeleteItem from direct button handler', { itemId: id });
+                forceDeleteItem(id);
+            }
+            cleanup();
+        };
+        forceBtn.addEventListener('click', directForce);
+    }
+
+    // Direct listeners for blockchain transfer actions
+    const downloadFromBlockchainBtn = menu.querySelector('.actions-menu-item[data-action="download-from-blockchain"]');
+    if (downloadFromBlockchainBtn) {
+        const directDownload = (ev) => {
+            console.debug('[actions-menu-item][direct] event', ev.type, { action: 'download-from-blockchain', itemId: downloadFromBlockchainBtn.dataset.itemId });
+            ev.preventDefault();
+            ev.stopPropagation();
+            ev.stopImmediatePropagation?.();
+            const id = downloadFromBlockchainBtn.dataset.itemId;
+            if (window.confirm(window.I18N.fileFolder.confirmDownloadChain)) {
+                console.debug('[diagnostic] invoking downloadFromBlockchain from direct button handler', { itemId: id });
+                downloadFromBlockchain(id);
+            }
+            cleanup();
+        };
+        downloadFromBlockchainBtn.addEventListener('click', directDownload);
+    }
+
+    const uploadToBlockchainBtn = menu.querySelector('.actions-menu-item[data-action="upload-to-blockchain"]');
+    if (uploadToBlockchainBtn) {
+        const directUpload = (ev) => {
+            ev.preventDefault();
+            ev.stopPropagation();
+            ev.stopImmediatePropagation?.();
+            
+            const id = uploadToBlockchainBtn.dataset.itemId;
+            console.debug('[actions-menu-item][direct] Upload to blockchain clicked', { 
+                action: 'upload-to-blockchain', 
+                itemId: id,
+                itemIdType: typeof id 
+            });
+            
+            // Validate file ID
+            if (!id || id === 'undefined' || id === 'null') {
+                console.error('Invalid file ID:', id);
+                alert('Unable to identify file. Please try again.');
+                cleanup();
+                return;
+            }
+            
+            // Open Arweave payment modal for permanent storage
+            if (window.openPermanentStorageModal) {
+                console.debug('[diagnostic] Opening Arweave payment modal for file:', id);
+                window.openPermanentStorageModal(id);
+            } else {
+                console.error('Permanent storage modal not available');
+                alert('Arweave storage feature is not available. Please refresh the page.');
+            }
+            cleanup();
+        };
+        uploadToBlockchainBtn.addEventListener('click', directUpload);
+    }
+
+    // Direct listener for upload to Arweave action
+    const uploadToArweaveBtn = menu.querySelector('.actions-menu-item[data-action="upload-to-arweave"]');
+    if (uploadToArweaveBtn) {
+        const directUploadArweave = (ev) => {
+            ev.preventDefault();
+            ev.stopPropagation();
+            
+            // Check if button is disabled (OTP protected) - check both disabled attribute and class
+            if (uploadToArweaveBtn.disabled || uploadToArweaveBtn.classList.contains('opacity-50')) {
+                showNotification('🔐 ' + window.I18N.fileFolder.otpProtected, 'error');
+                cleanup();
+                return;
+            }
+            
+            const id = uploadToArweaveBtn.dataset.itemId;
+            console.log('Upload to Arweave clicked for file:', id);
+            
+            // Call function to load file and open Arweave modal
+            loadFileForArweaveUpload(id);
+            cleanup();
+        };
+        uploadToArweaveBtn.addEventListener('click', directUploadArweave);
+    }
+
+    // Blockchain-specific action handlers
+    const viewOnIpfsBtn = menu.querySelector('.actions-menu-item[data-action="view-on-ipfs"]');
+    if (viewOnIpfsBtn) {
+        viewOnIpfsBtn.addEventListener('click', (ev) => {
+            ev.preventDefault();
+            ev.stopPropagation();
+            const id = viewOnIpfsBtn.dataset.itemId;
+            viewOnIPFS(id);
+            cleanup();
+        });
+    }
+
+    const copyIpfsHashBtn = menu.querySelector('.actions-menu-item[data-action="copy-ipfs-hash"]');
+    if (copyIpfsHashBtn) {
+        copyIpfsHashBtn.addEventListener('click', (ev) => {
+            ev.preventDefault();
+            ev.stopPropagation();
+            const id = copyIpfsHashBtn.dataset.itemId;
+            copyIPFSHash(id);
+            cleanup();
+        });
+    }
+
+    const blockchainInfoBtn = menu.querySelector('.actions-menu-item[data-action="blockchain-info"]');
+    if (blockchainInfoBtn) {
+        blockchainInfoBtn.addEventListener('click', (ev) => {
+            ev.preventDefault();
+            ev.stopPropagation();
+            const id = blockchainInfoBtn.dataset.itemId;
+            showBlockchainInfo(id);
+            cleanup();
+        });
+    }
+
+    const shareIpfsBtn = menu.querySelector('.actions-menu-item[data-action="share-ipfs-link"]');
+    if (shareIpfsBtn) {
+        shareIpfsBtn.addEventListener('click', (ev) => {
+            ev.preventDefault();
+            ev.stopPropagation();
+            const id = shareIpfsBtn.dataset.itemId;
+            shareIPFSLink(id);
+            cleanup();
+        });
+    }
+
+    const rmBlockchainBtn = menu.querySelector('.actions-menu-item[data-action="remove-from-blockchain"]');
+    if (rmBlockchainBtn) {
+        const directRmBlockchain = (ev) => {
+            ev.preventDefault();
+            ev.stopPropagation();
+            const id = rmBlockchainBtn.dataset.itemId;
+            if (id && typeof window.removeFromBlockchain === 'function') {
+                window.removeFromBlockchain(id);
+            } else {
+                console.error('removeFromBlockchain function not available or item ID missing');
+            }
+            cleanup();
+        };
+        rmBlockchainBtn.addEventListener('click', directRmBlockchain);
+    }
+
+    const enablePermanentBtn = menu.querySelector('.actions-menu-item[data-action="enable-permanent-storage"]');
+    if (enablePermanentBtn) {
+        const directEnablePermanent = (ev) => {
+            ev.preventDefault();
+            ev.stopPropagation();
+            const id = enablePermanentBtn.dataset.itemId;
+            if (id && typeof window.enablePermanentStorage === 'function') {
+                window.enablePermanentStorage(id);
+            } else {
+                console.error('enablePermanentStorage function not available or item ID missing');
+            }
+            cleanup();
+        };
+        enablePermanentBtn.addEventListener('click', directEnablePermanent);
+    }
+
+    const renameBtn = menu.querySelector('.actions-menu-item[data-action="rename"]');
+    if (renameBtn) {
+        const directRename = (ev) => {
+            console.debug('[actions-menu-item][direct] event', ev.type, { action: 'rename', itemId: renameBtn.dataset.itemId });
+            ev.preventDefault();
+            ev.stopPropagation();
+            ev.stopImmediatePropagation?.();
+            const id = renameBtn.dataset.itemId;
+            showRenameModal(id);
+            cleanup();
+        };
+        renameBtn.addEventListener('click', directRename);
+    }
+
+    const openFolderBtn = menu.querySelector('.actions-menu-item[data-action="open-folder"]');
+    if (openFolderBtn) {
+        const directOpenFolder = (ev) => {
+            console.debug('[actions-menu-item][direct] event', ev.type, { action: 'open-folder', itemId: openFolderBtn.dataset.itemId });
+            ev.preventDefault();
+            ev.stopPropagation();
+            ev.stopImmediatePropagation?.();
+            const id = openFolderBtn.dataset.itemId;
+            const item = findItemById(id);
+            if (item) {
+                navigateToFolder(item.id, item.file_name || item.name);
+            }
+            cleanup();
+        };
+        openFolderBtn.addEventListener('click', directOpenFolder);
+    }
+
+    const openBtn = menu.querySelector('.actions-menu-item[data-action="open"]');
+    if (openBtn) {
+        const directOpen = (ev) => {
+            console.debug('[actions-menu-item][direct] event', ev.type, { action: 'open', itemId: openBtn.dataset.itemId });
+            ev.preventDefault();
+            ev.stopPropagation();
+            ev.stopImmediatePropagation?.();
+            const id = openBtn.dataset.itemId;
+            // Directly navigate to the file preview page
+            window.location.href = `/files/${id}/preview`;
+            cleanup();
+        };
+        openBtn.addEventListener('click', directOpen);
+    }
+
+    // Direct listeners for vector actions to ensure reliability
+    const rmVectorBtn = menu.querySelector('.actions-menu-item[data-action="remove-from-vector"]');
+    console.debug('[DEBUG] Looking for vector removal button:', !!rmVectorBtn);
+    if (rmVectorBtn) {
+        console.debug('[DEBUG] Found vector removal button, attaching listener');
+        const directRmVector = (ev) => {
+            console.debug('[DEBUG] Vector removal button clicked!', ev.type, { action: 'remove-from-vector', itemId: rmVectorBtn.dataset.itemId });
+            ev.preventDefault();
+            ev.stopPropagation();
+            ev.stopImmediatePropagation?.();
+            const id = rmVectorBtn.dataset.itemId;
+            console.debug('[DEBUG] Directly calling removeFromVectorDatabase for itemId:', id);
+            
+            try {
+                removeFromVectorDatabase(id);
+                console.debug('[DEBUG] removeFromVectorDatabase called successfully');
+            } catch (error) {
+                console.error('[DEBUG] Error calling removeFromVectorDatabase:', error);
+            }
+            cleanup();
+        };
+        rmVectorBtn.addEventListener('click', directRmVector);
+    }
+
+    const addVectorBtn = menu.querySelector('.actions-menu-item[data-action="add-to-vector"]');
+    console.debug('[DEBUG] Looking for vector add button:', !!addVectorBtn);
+    if (addVectorBtn) {
+        console.debug('[DEBUG] Found vector add button, attaching listener');
+        const directAddVector = (ev) => {
+            console.debug('[DEBUG] Vector add button clicked!', ev.type, { action: 'add-to-vector', itemId: addVectorBtn.dataset.itemId });
+            ev.preventDefault();
+            ev.stopPropagation();
+            ev.stopImmediatePropagation?.();
+            
+            // Check if button is disabled (OTP protected) - check both disabled attribute and class
+            if (addVectorBtn.disabled || addVectorBtn.classList.contains('opacity-50')) {
+                showNotification('🔐 This file has OTP protection enabled. Cannot share OTP-protected files with AI.', 'error');
+                cleanup();
+                return;
+            }
+            
+            const id = addVectorBtn.dataset.itemId;
+            console.debug('[DEBUG] Directly calling addToVectorDatabase for itemId:', id);
+            
+            try {
+                addToVectorDatabase(id);
+                console.debug('[DEBUG] addToVectorDatabase called successfully');
+            } catch (error) {
+                console.error('[DEBUG] Error calling addToVectorDatabase:', error);
+            }
+            cleanup();
+        };
+        addVectorBtn.addEventListener('click', directAddVector);
+    }
+
+    const restoreVecBtn = menu.querySelector('.actions-menu-item[data-action="restore-vectors"]');
+    if (restoreVecBtn) {
+        const directRestoreVec = (ev) => {
+            console.debug('[actions-menu-item][direct] event', ev.type, { action: 'restore-vectors', itemId: restoreVecBtn.dataset.itemId });
+            ev.preventDefault();
+            ev.stopPropagation();
+            ev.stopImmediatePropagation?.();
+            const id = restoreVecBtn.dataset.itemId;
+            if (window.confirm(window.I18N.fileFolder.confirmRestoreVec)) {
+                console.debug('[diagnostic] invoking restoreVectors from direct button handler', { itemId: id });
+                restoreVectors(id);
+            }
+            cleanup();
+        };
+        restoreVecBtn.addEventListener('click', directRestoreVec);
+    }
+
+
+    // Bind listeners for outside/escape closing
+    function onOutsideClick(e) {
+        if (!menu.contains(e.target) && !button.contains(e.target)) {
+            cleanup();
+        }
+    }
+    document.addEventListener('click', onOutsideClick);
+    function onEsc(e) {
+        if (e.key === 'Escape') {
+            cleanup();
+        }
+    }
+    document.addEventListener('keydown', onEsc);
+}
+
+function renderPagination(meta) {
+    const container = document.getElementById('paginationContainer');
+    if (!container) return;
+    container.innerHTML = meta.links.map(link => `
+        <button 
+            class="pagination-btn px-4 py-2 mx-1 rounded-lg ${link.active ? 'bg-primary text-white' : 'bg-gray-700'} ${!link.url ? 'opacity-50 cursor-not-allowed' : ''}"
+            data-page="${new URLSearchParams(link.url?.split('?')[1]).get('page')}"
+            ${!link.url ? 'disabled' : ''}>
+            ${link.label.replace(/&laquo;|&raquo;/g, '')}
+        </button>
+    `).join('');
+
+    container.querySelectorAll('.pagination-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const page = btn.dataset.page;
+            if (page) {
+                state.currentPage = parseInt(page);
+                loadUserFiles(state.lastMainSearch, state.currentPage, state.currentParentId);
+            }
+        });
+    });
+}
+
+async function deleteItem(itemId) {
+    try {
+        console.debug('[deleteItem] Initiating delete', { itemId });
+        showNotification(window.I18N.fileFolder.btnEmptying.replace('...', '') + '...', 'info'); // approximating 'Deleting...'
+        const response = await fetch(`/files/${itemId}`, {
+            method: 'DELETE',
+            headers: {
+                'X-CSRF-TOKEN': getCsrfToken(),
+                'X-XSRF-TOKEN': getCsrfToken(),
+                'Accept': 'application/json',
+                'X-Requested-With': 'XMLHttpRequest'
+            },
+            credentials: 'same-origin'
+        });
+        console.debug('[deleteItem] Fetch completed', { status: response.status });
+        const ct = response.headers.get('Content-Type') || '';
+        console.debug('[deleteItem] Response received', { status: response.status, ok: response.ok, contentType: ct });
+        // Consider non-JSON responses as an error (likely redirect to login or HTML error page)
+        if (!ct.includes('application/json')) {
+            const text = await response.text().catch(() => '');
+            console.error('[deleteItem] Unexpected non-JSON response body (possible redirect):', text?.slice(0, 200));
+            throw new Error('Move to trash failed: unexpected response (are you still logged in?)');
+        }
+        if (!response.ok) {
+            // Try to parse JSON, else fallback to text
+            let errorMessage = `Failed to move item to trash (status ${response.status})`;
+            try {
+                if (ct.includes('application/json')) {
+                    const errorData = await response.json();
+                    errorMessage = errorData.message || errorMessage;
+                } else {
+                    const text = await response.text();
+                    console.error('[deleteItem] Non-JSON error response:', text);
+                }
+            } catch (parseErr) {
+                console.error('[deleteItem] Error parsing error response:', parseErr);
+            }
+            throw new Error(errorMessage);
+        }
+
+        showNotification(window.I18N.fileFolder.msgDeleteSuccess, 'success');
+        
+        // Trigger storage usage update
+        document.dispatchEvent(new CustomEvent('fileDeleted', { 
+            detail: { itemId } 
+        }));
+        
+        loadUserFiles(state.lastMainSearch, state.currentPage, state.currentParentId);
+    } catch (error) {
+        console.error('Error moving item to trash:', error);
+        showNotification(error.message, 'error');
+    }
+}
+
+async function restoreItem(itemId, skipDialog = false) {
+    try {
+        console.debug('[restoreItem] Initiating restore', { itemId, skipDialog });
+        
+        // Check if we're in trash view and inside a deleted folder
+        const container = document.getElementById('filesContainer');
+        const inTrashView = container?.dataset.view === 'trash';
+        const isInsideDeletedFolder = inTrashView && state.currentParentId !== null;
+        
+        // If restoring from inside a deleted folder, show dialog and restore to root
+        let restoreToRoot = false;
+        if (isInsideDeletedFolder && !skipDialog) {
+            const confirmed = window.confirm(
+                'This file will be restored to the root because its parent folder is deleted.\n\nContinue?'
+            );
+            if (!confirmed) {
+                console.debug('[restoreItem] Restore cancelled by user');
+                return;
+            }
+            restoreToRoot = true;
+        } else if (isInsideDeletedFolder && skipDialog) {
+            // When bulk restoring, automatically restore to root
+            restoreToRoot = true;
+        }
+        
+        // Prepare request body
+        const requestBody = restoreToRoot ? { restore_to_root: true } : {};
+        
+        const response = await fetch(`/files/${itemId}/restore`, {
+            method: 'PATCH',
+            headers: {
+                'X-CSRF-TOKEN': getCsrfToken(),
+                'X-XSRF-TOKEN': getCsrfToken(),
+                'Accept': 'application/json',
+                'Content-Type': 'application/json',
+                'X-Requested-With': 'XMLHttpRequest'
+            },
+            credentials: 'same-origin',
+            body: Object.keys(requestBody).length > 0 ? JSON.stringify(requestBody) : undefined
+        });
+
+        console.debug('[restoreItem] Fetch completed', { status: response.status, restoreToRoot });
+        if (!response.ok) {
+            const errorData = await response.json().catch(() => ({}));
+            throw new Error(errorData.message || 'Failed to restore item');
+        }
+
+        showNotification(window.I18N.fileFolder.msgRestoreSuccess, 'success');
+        
+        // Trigger storage usage update
+        document.dispatchEvent(new CustomEvent('fileRestored', { 
+            detail: { itemId } 
+        }));
+        
+        // Refresh trash view
+        if (typeof loadTrashItems === 'function') {
+            if (inTrashView) {
+                // If we're in trash, reload the current folder view
+                await loadTrashItemsInFolder(state.currentParentId);
+            } else {
+                await loadTrashItems();
+            }
+        }
+    } catch (error) {
+        console.error('Error restoring item:', error);
+        showNotification(error.message, 'error');
+    }
+}
+
+// Remove blockchain items helper
+async function removeBlockchainItem(itemId) {
+    try {
+        const response = await fetch(`/files/${itemId}/remove-from-blockchain`, {
+            method: 'DELETE',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]')?.content || '',
+                'X-Requested-With': 'XMLHttpRequest'
+            },
+            credentials: 'same-origin'
+        });
+
+        if (!response.ok) {
+            const errorData = await response.json().catch(() => ({}));
+            throw new Error(errorData.message || `Failed to remove from blockchain: ${response.status}`);
+        }
+
+        const result = await response.json();
+        
+        if (result.success) {
+            showNotification(window.I18N.fileFolder.removeFromBlockchain + ' ' + window.I18N.upload.successAll.replace('All :count file(s)', ''), 'success');
+            // Refresh blockchain items if we're in blockchain view
+            const container = document.getElementById('filesContainer');
+            if (container?.dataset.view === 'blockchain') {
+                await loadBlockchainItems();
+            }
+        } else {
+            throw new Error(result.message || 'Failed to remove from blockchain');
+        }
+        
+    } catch (error) {
+        console.error('Error removing blockchain item:', error);
+        showNotification(`Failed to remove from blockchain: ${error.message}`, 'error');
+    }
+}
+
+// Download file from blockchain to Supabase storage
+async function downloadFromBlockchain(itemId) {
+    try {
+        showNotification('Downloading file from blockchain...', 'info');
+        
+        const response = await fetch(`/files/${itemId}/download-from-blockchain`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]')?.content || '',
+                'X-Requested-With': 'XMLHttpRequest'
+            },
+            credentials: 'same-origin'
+        });
+
+        if (!response.ok) {
+            const errorData = await response.json().catch(() => ({}));
+            throw new Error(errorData.message || `Failed to download from blockchain: ${response.status}`);
+        }
+
+        const result = await response.json();
+        
+        if (result.success) {
+            showNotification('File downloaded to Supabase storage successfully', 'success');
+            // Refresh the current view
+            const container = document.getElementById('filesContainer');
+            if (container?.dataset.view === 'blockchain') {
+                await loadBlockchainItems();
+            } else {
+                await loadUserFiles();
+            }
+        } else {
+            throw new Error(result.message || 'Failed to download from blockchain');
+        }
+        
+    } catch (error) {
+        console.error('Error downloading from blockchain:', error);
+        showNotification(`Failed to download from blockchain: ${error.message}`, 'error');
+    }
+}
+
+// Upload file to blockchain storage
+async function uploadToBlockchain(itemId) {
+    try {
+        showNotification((window.I18N?.fileFolder?.msgCopying || 'Uploading...'), 'info');
+        
+        const response = await fetch(`/blockchain/upload-existing`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]')?.content || '',
+                'X-Requested-With': 'XMLHttpRequest'
+            },
+            credentials: 'same-origin',
+            body: JSON.stringify({
+                file_id: itemId,
+                provider: 'arweave'
+            })
+        });
+
+        if (!response.ok) {
+            const errorData = await response.json().catch(() => ({}));
+            throw new Error(errorData.message || `Failed to upload to blockchain: ${response.status}`);
+        }
+
+        const result = await response.json();
+        
+        if (result.success) {
+            showNotification(window.I18N?.upload?.successAll?.replace('All :count file(s)', 'File') || 'File uploaded successfully', 'success');
+            // Refresh the current view
+            const container = document.getElementById('filesContainer');
+            if (container?.dataset.view === 'main') {
+                await loadUserFiles();
+            }
+        } else {
+            throw new Error(result.message || 'Failed to upload to blockchain');
+        }
+        
+    } catch (error) {
+        console.error('Error uploading to blockchain:', error);
+        showNotification(`Failed to upload to blockchain: ${error.message}`, 'error');
+    }
+}
+
+// View file on IPFS gateway
+function viewOnIPFS(itemId) {
+    const item = findItemById(itemId);
+    if (!item) {
+        showNotification(window.I18N.fileFolder.msgFileNotFound, 'error');
+        return;
+    }
+    
+    // Extract IPFS hash from various possible sources
+    let ipfsHash = item.ipfs_hash;
+    
+    // Try to extract from blockchain_url if no direct hash
+    if (!ipfsHash && item.blockchain_url) {
+        const match = item.blockchain_url.match(/\/ipfs\/([a-zA-Z0-9]+)/);
+        if (match) {
+            ipfsHash = match[1];
+        }
+    }
+    
+    // Try to extract from file_path
+    if (!ipfsHash && item.file_path) {
+        ipfsHash = item.file_path.replace('ipfs://', '');
+    }
+    
+    if (!ipfsHash || ipfsHash.length < 10) {
+        showNotification(window.I18N.fileFolder.msgIpfsNotFound, 'error');
+        return;
+    }
+    
+    // Always construct the proper Arweave gateway URL format
+    const gatewayUrl = `https://arweave.net/${ipfsHash}`;
+    console.log('Opening IPFS gateway URL:', gatewayUrl);
+    
+    window.open(gatewayUrl, '_blank');
+    showNotification(window.I18N?.fileFolder?.viewOnIPFS + '...', 'success');
+}
+
+// Copy IPFS hash to clipboard
+async function copyIPFSHash(itemId) {
+    const item = findItemById(itemId);
+    if (!item) {
+        showNotification('File not found', 'error');
+        return;
+    }
+    
+    const ipfsHash = item.ipfs_hash || (item.file_path ? item.file_path.replace('ipfs://', '') : null);
+    if (!ipfsHash) {
+        showNotification(window.I18N.fileFolder.msgIpfsNotFound, 'error');
+        return;
+    }
+    
+    try {
+        await navigator.clipboard.writeText(ipfsHash);
+        showNotification(window.I18N.fileFolder.msgIpfsCopied, 'success');
+    } catch (error) {
+        // Fallback for older browsers
+        const textArea = document.createElement('textarea');
+        textArea.value = ipfsHash;
+        document.body.appendChild(textArea);
+        textArea.select();
+        document.execCommand('copy');
+        document.body.removeChild(textArea);
+        showNotification(window.I18N.fileFolder.msgIpfsCopied, 'success');
+    }
+}
+
+// Show blockchain information modal
+function showBlockchainInfo(itemId) {
+    const item = findItemById(itemId);
+    if (!item) {
+        showNotification('File not found', 'error');
+        return;
+    }
+    
+    const metadata = item.blockchain_metadata || {};
+    const ipfsHash = item.ipfs_hash || (item.file_path ? item.file_path.replace('ipfs://', '') : 'N/A');
+    
+    const infoHtml = `
+        <div class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50" id="blockchainInfoModal">
+            <div class="bg-[#0D0E2F] p-6 rounded-lg max-w-md w-full mx-4 border border-[#4A4D6A]">
+                <h3 class="text-lg font-semibold text-white mb-4">${window.I18N?.blockchain?.blockchainInfo ||
+                window.I18N?.fileFolder?.blockchainInfo || 'Blockchain Information'}</h3>
+                <div class="space-y-3 text-sm">
+                    <div class="flex justify-between">
+                        <span class="text-gray-400">${window.I18N.fileFolder.fileName}:</span>
+                        <span class="text-white">${escapeHtml(item.file_name)}</span>
+                    </div>
+                    <div class="flex justify-between">
+                        <span class="text-gray-400">${window.I18N.fileFolder.provider || 'Provider'}:</span>
+                        <span class="text-white capitalize">${metadata.provider || 'Arweave'}</span>
+                    </div>
+                    <div class="flex justify-between">
+                        <span class="text-gray-400">${window.I18N.fileFolder.status || 'Status'}:</span>
+                        <span class="text-green-400">${metadata.pin_status || 'Pinned'}</span>
+                    </div>
+                    <div class="flex justify-between">
+                        <span class="text-gray-400">${window.I18N.fileFolder.encrypted || 'Encrypted'}:</span>
+                        <span class="text-white">${metadata.encrypted ? window.I18N.fileFolder.yes || 'Yes' : window.I18N.fileFolder.no || 'No'}</span>
+                    </div>
+                    <div class="flex justify-between">
+                        <span class="text-gray-400">${window.I18N.fileFolder.redundancy || 'Redundancy'}:</span>
+                        <span class="text-white">${metadata.redundancy_level || 3}x</span>
+                    </div>
+                    <div class="mt-4">
+                        <span class="text-gray-400">IPFS Hash:</span>
+                        <div class="mt-1 p-2 bg-[#1A1D3A] rounded border font-mono text-xs text-gray-300 break-all">
+                            ${ipfsHash}
+                        </div>
+                    </div>
+                </div>
+                <div class="flex justify-end gap-2 mt-6">
+                    <button onclick="document.getElementById('blockchainInfoModal').remove()" 
+                        class="px-4 py-2 bg-gray-600 text-white rounded hover:bg-gray-700">
+                        ${window.I18N.fileFolder.close}
+                    </button>
+                    <button onclick="copyIPFSHash(${itemId}); document.getElementById('blockchainInfoModal').remove()" 
+                        class="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700">
+                        ${window.I18N?.fileFolder?.copyHash || 'Copy Hash'}
+                    </button>
+                </div>
+            </div>
+        </div>
+    `;
+    
+    document.body.insertAdjacentHTML('beforeend', infoHtml);
+}
+
+// Share IPFS link
+async function shareIPFSLink(itemId) {
+    const item = findItemById(itemId);
+    if (!item) {
+        showNotification('File not found', 'error');
+        return;
+    }
+    
+    const ipfsHash = item.ipfs_hash || (item.file_path ? item.file_path.replace('ipfs://', '') : null);
+    if (!ipfsHash) {
+        showNotification(window.I18N.fileFolder.msgIpfsNotFound, 'error');
+        return;
+    }
+    
+    const gatewayUrl = item.blockchain_url || `https://arweave.net/${ipfsHash}`;
+    const shareData = {
+        title: `SecureDocs: ${item.file_name}`,
+        text: `Check out this file on IPFS: ${item.file_name}`,
+        url: gatewayUrl
+    };
+    
+    try {
+        if (navigator.share) {
+            await navigator.share(shareData);
+            showNotification(window.I18N.fileFolder.msgIpfsShared, 'success');
+        } else {
+            // Fallback - copy to clipboard
+            await navigator.clipboard.writeText(gatewayUrl);
+            showNotification(window.I18N.fileFolder.msgIpfsCopied, 'success');
+        }
+    } catch (error) {
+        console.error('Error sharing:', error);
+        showNotification(window.I18N.fileFolder.msgShareLinkFailed, 'error');
+    }
+}
+
+async function forceDeleteItem(itemId) {
+    try {
+        console.debug('Force deleting item:', itemId);
+        const response = await fetch(`/files/${itemId}/force-delete`, {
+            method: 'DELETE',
+            headers: {
+                'Accept': 'application/json',
+                'Content-Type': 'application/json',
+                'X-Requested-With': 'XMLHttpRequest',
+                'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]')?.content || ''
+            },
+            credentials: 'same-origin'
+        });
+
+        const data = await response.json();
+
+        if (!response.ok) {
+            throw new Error(data.message || window.I18N.fileFolder.msgVecRestoreFailed);
+        }
+
+        showNotification(window.I18N.fileFolder.msgVecRestoreSuccess, 'success');
+        loadTrashItems();
+    } catch (error) {
+        console.error('Error permanently deleting item:', error);
+        showNotification(error.message, 'error');
+    }
+}
+
+async function removeFromVectorDatabase(itemId) {
+    try {
+        console.log('[VECTOR REMOVAL] Starting removal for itemId:', itemId);
+        
+        const csrfToken = getCsrfToken();
+        const url = `/files/${itemId}/remove-from-vector`;
+        console.log('[VECTOR REMOVAL] Making request to:', url);
+        
+        const response = await fetch(url, {
+            method: 'DELETE',
+            headers: {
+                'Accept': 'application/json',
+                'Content-Type': 'application/json',
+                'X-Requested-With': 'XMLHttpRequest',
+                'X-CSRF-TOKEN': csrfToken
+            },
+            credentials: 'same-origin'
+        });
+
+        console.log('[VECTOR REMOVAL] Response status:', response.status, response.statusText);
+        
+        let data;
+        try {
+            data = await response.json();
+            console.log('[VECTOR REMOVAL] Response data:', data);
+        } catch (e) {
+            console.error('[VECTOR REMOVAL] Failed to parse response JSON:', e);
+            throw new Error('Invalid response from server');
+        }
+
+        if (!response.ok) {
+            console.error('[VECTOR REMOVAL] Request failed with status:', response.status, data);
+            throw new Error(data.message || `HTTP ${response.status}: Failed to remove file from vector database`);
+        }
+
+        console.log('[VECTOR REMOVAL] Success! Showing notification...');
+        
+        // Show success notification
+        if (window.notificationManager) {
+            window.notificationManager.showSuccess(
+                window.I18N.fileFolder.vecRemovedTitle || 'Vector Removed Successfully',
+                window.I18N.fileFolder.msgVecRemoved || 'File has been removed from AI vector database'
+            );
+        } else {
+            showNotification(window.I18N.fileFolder.msgVecRemoved || 'File has been removed from AI vector database', 'success');
+        }
+        
+        // Update local state
+        try {
+            const item = state.lastItems?.find(i => i.id == itemId);
+            if (item) {
+                console.log('[VECTOR REMOVAL] Updating local state for item:', item.file_name);
+                item.is_vectorized = false;
+                item.vectorized_at = null;
+            }
+        } catch (e) {
+            console.debug('[VECTOR REMOVAL] Local state update failed (non-fatal):', e);
+        }
+        
+        console.log('[VECTOR REMOVAL] Reloading file list...');
+        loadUserFiles(state.lastMainSearch, state.currentPage, state.currentParentId);
+        
+    } catch (error) {
+        console.error('[VECTOR REMOVAL] Error removing file from vector database:', error);
+        
+        if (window.notificationManager) {
+            window.notificationManager.showError(
+                window.I18N.fileFolder.vecRemovalFailedTitle || 'Vector Removal Failed',
+                error.message || window.I18N.fileFolder.msgVecRemovalFailed || 'Failed to remove file from vector database'
+            );
+        } else {
+            showNotification(error.message || window.I18N.fileFolder.msgVecRemovalFailed || 'Failed to remove file from vector database', 'error');
+        }
+    }
+}
+
+async function addToVectorDatabase(itemId) {
+    try {
+        const csrfToken = getCsrfToken();
+        const url = `/files/${itemId}/add-to-vector`;
+        
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: {
+                'Accept': 'application/json',
+                'Content-Type': 'application/json',
+                'X-Requested-With': 'XMLHttpRequest',
+                'X-CSRF-TOKEN': csrfToken
+            },
+            credentials: 'same-origin'
+        });
+        
+        let data;
+        try {
+            data = await response.json();
+        } catch (e) {
+            console.error('Failed to parse vectorization response JSON:', e);
+            throw new Error('Invalid response from server');
+        }
+
+        if (!response.ok) {
+            console.error('Vectorization request failed with status:', response.status, data);
+            throw new Error(data.message || `HTTP ${response.status}: Failed to add file to vector database`);
+        }
+        
+        // Show success notification
+        if (window.notificationManager) {
+            window.notificationManager.showSuccess(
+                window.I18N.fileFolder.vecProcessingStartedTitle || 'Vector Processing Started',
+                data.message || window.I18N.fileFolder.msgVecStarted || 'File sent for vectorization processing'
+            );
+        } else {
+            showNotification(data.message || window.I18N.fileFolder.msgVecStarted || 'File sent for vectorization processing', 'success');
+        }
+
+        // Optimistically update UI state for the item (if present)
+        try {
+            const item = state.lastItems?.find(i => i.id == itemId);
+            if (item) {
+                // Don't mark as fully vectorized yet, as it's processing
+            }
+        } catch (e) {
+            // non-fatal UI state update failure
+        }
+        
+        loadUserFiles(state.lastMainSearch, state.currentPage, state.currentParentId);
+        
+    } catch (error) {
+        console.error('Error adding file to vector database:', error);
+        
+        if (window.notificationManager) {
+            window.notificationManager.showError(
+                window.I18N.fileFolder.vecProcessingFailedTitle || 'Vector Processing Failed',
+                error.message || window.I18N.fileFolder.msgVecProcessingFailed || 'Failed to send file for vector processing'
+            );
+        } else {
+            showNotification(error.message || window.I18N.fileFolder.msgVecProcessingFailed || 'Failed to send file for vector processing', 'error');
+        }
+    }
+}
+
+async function restoreVectors(itemId) {
+    try {
+        console.debug('Restoring vectors for item:', itemId);
+        const response = await fetch(`/files/${itemId}/restore-vectors`, {
+            method: 'PATCH',
+            headers: {
+                'Accept': 'application/json',
+                'Content-Type': 'application/json',
+                'X-Requested-With': 'XMLHttpRequest',
+                'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]')?.content || ''
+            },
+            credentials: 'same-origin'
+        });
+
+        const data = await response.json().catch(() => ({}));
+
+        if (!response.ok) {
+            throw new Error(data.message || 'Failed to restore vectors');
+        }
+
+        showNotification('Vectors restored successfully.', 'success');
+        const itemsContainer = document.getElementById('filesContainer');
+        const inTrashView = (itemsContainer?.dataset.view === 'trash');
+        if (inTrashView && typeof loadTrashItems === 'function') {
+            await loadTrashItems();
+        } else {
+            loadUserFiles(state.lastMainSearch, state.currentPage, state.currentParentId);
+        }
+    } catch (error) {
+        console.error('Error restoring vectors:', error);
+        showNotification(error.message, 'error');
+    }
+}
+
+async function removeFromBlockchain(itemId) {
+    try {
+        console.debug('Removing item from blockchain storage:', itemId);
+        const response = await fetch(`/files/${itemId}/remove-from-blockchain`, {
+            method: 'DELETE',
+            headers: {
+                'Accept': 'application/json',
+                'Content-Type': 'application/json',
+                'X-Requested-With': 'XMLHttpRequest',
+                'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]')?.content || ''
+            },
+            credentials: 'same-origin'
+        });
+
+        const data = await response.json();
+
+        if (!response.ok) {
+            throw new Error(data.message || 'Failed to remove file from blockchain storage');
+        }
+
+        showNotification('File removed from blockchain storage successfully.', 'success');
+        loadUserFiles(state.lastMainSearch, state.currentPage, state.currentParentId);
+    } catch (error) {
+        console.error('Error removing file from blockchain storage:', error);
+        showNotification(error.message, 'error');
+    }
+}
+
+/**
+ * Loads files and folders from the server and renders them.
+ * This function is designed to be independent and requires UI rendering functions to be passed as arguments.
+ * @param {string} query - The search query.
+ * @param {number} page - The page number for pagination.
+ * @param {number|null} parentId - The ID of the parent folder.
+ * @param {function} createItemElement - Function to create a DOM element for a file/folder.
+ * @param {function} addPaginationControls - Function to render pagination UI.
+ * @param {function} addItemEventListeners - Function to add event listeners to items.
+ */
+// Default render helpers used when not provided by caller
+function defaultCreateItemElement(item) {
+    const isFolder = !!item.is_folder;
+    const name = item.file_name || item.name || 'Untitled';
+    const size = isFolder ? 0 : parseInt(item.file_size || 0, 10);
+    const updatedAt = item.updated_at ? new Date(item.updated_at).toLocaleDateString() : '';
+
+    const wrapper = document.createElement('div');
+    wrapper.className = 'file-item bg-gray-800 p-4 rounded-lg flex items-center justify-between cursor-pointer';
+    wrapper.setAttribute('data-item-id', item.id);
+    wrapper.setAttribute('data-item-name', name);
+    wrapper.setAttribute('data-is-folder', isFolder);
+    if (isFolder) {
+        wrapper.setAttribute('data-folder-nav-id', item.id);
+        wrapper.setAttribute('data-folder-nav-name', name);
+    }
+
+    const icon = isFolder ? '📁' : '📄';
+    wrapper.innerHTML = `
+        <div class="flex items-center truncate">
+            <span class="text-2xl mr-4">${icon}</span>
+            <span class="truncate">${escapeHtml(name)}</span>
+        </div>
+        <div class="text-sm text-gray-400 flex items-center">
+            ${isFolder ? '' : `<span>${formatFileSize(size)}</span><span class="mx-2">|</span>`}
+            <span>${escapeHtml(updatedAt)}</span>
+            <button class="delete-item-btn ml-4 text-red-500 hover:text-red-400" data-item-id="${item.id}" title="Move to trash" aria-label="Move to trash">🗑️</button>
+        </div>
+    `;
+    return wrapper;
+}
+
+function defaultAddItemEventListeners() {
+    const container = document.getElementById('filesContainer');
+    if (!container) return;
+    container.querySelectorAll('.delete-item-btn').forEach(btn => {
+        btn.addEventListener('click', e => {
+            e.stopPropagation();
+            const itemId = e.currentTarget.dataset.itemId;
+            // Check confirmation and call delete
+            if (window.confirm(window.I18N.fileFolder.confirmMoveTrash)) {
+                // Assuming deleteItem is available in scope or window
+                if (typeof deleteItem === 'function') {
+                    deleteItem(itemId);
+                } else if (window.__files && window.__files.deleteItem) {
+                    window.__files.deleteItem(itemId);
+                }
+            }
+        });
+    });
+    container.querySelectorAll('[data-folder-nav-id]').forEach(folder => {
+        folder.addEventListener('click', e => {
+            const folderId = e.currentTarget.dataset.folderNavId;
+            const folderName = e.currentTarget.dataset.folderNavName;
+            navigateToFolder(folderId, folderName);
+        });
+    });
+}
+
+function defaultAddPaginationControls(itemsContainer, meta) {
+    // Remove existing pagination block if present
+    const existing = document.getElementById('filesPagination');
+    existing?.remove();
+
+    const pag = document.createElement('div');
+    pag.id = 'filesPagination';
+    pag.className = 'col-span-full flex justify-center gap-2 mt-4';
+
+    (meta.links || []).forEach(link => {
+        const btn = document.createElement('button');
+        btn.className = `px-3 py-1 rounded ${link.active ? 'bg-primary text-white' : 'bg-gray-700 text-gray-200'} ${!link.url ? 'opacity-50 cursor-not-allowed' : 'hover:bg-gray-600'}`;
+        btn.innerText = link.label.replace(/&laquo;|&raquo;/g, '').trim();
+        if (!link.url) btn.disabled = true;
+        const pageParam = link.url ? new URL(link.url, window.location.origin).searchParams.get('page') : null;
+        if (pageParam) {
+            btn.addEventListener('click', () => {
+                state.currentPage = parseInt(pageParam);
+                loadUserFiles(state.lastMainSearch, state.currentPage, state.currentParentId);
+            });
+        }
+        pag.appendChild(btn);
+    });
+
+    itemsContainer.parentElement?.appendChild(pag) || itemsContainer.appendChild(pag);
+}
+
+export async function loadUserFiles(query = '', page = 1, parentId = null, createItemElement, addPaginationControls, addItemEventListeners) {
+    const itemsContainer = document.getElementById('filesContainer');
+    if (!itemsContainer) {
+        console.debug('Items container not found - skipping file loading');
+        return;
+    }
+    // Mark main view so actions menu renders correct options
+    itemsContainer.dataset.view = 'main';
+    // Hide trash banner when not in trash view
+    hideTrashBanner();
+
+    // Create unique request ID to prevent race conditions
+    const requestId = Date.now() + Math.random();
+    state.currentRequestId = requestId;
+
+    try {
+        // Clear immediately to prevent showing stale content
+        itemsContainer.innerHTML = `<div class="p-4 text-center text-text-secondary col-span-full">${window.I18N?.fileFolder?.loading || 'Loading...'}</div>`;
+        let url = `/files?page=${page}`;
+        if (query) url += `&q=${encodeURIComponent(query)}`;
+        if (parentId !== null && parentId !== "null") url += `&parent_id=${parentId}`;
+
+        const response = await fetch(url, {
+            headers: {
+                'Accept': 'application/json',
+                'X-Requested-With': 'XMLHttpRequest',
+                'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]')?.content || ''
+            },
+            credentials: 'same-origin'
+        });
+
+        // Check if this request is still the latest one
+        if (state.currentRequestId !== requestId) {
+            console.debug('Ignoring outdated request response');
+            return;
+        }
+
+        if (!response.ok) {
+            const errorData = await response.json().catch(() => ({}));
+            throw new Error(errorData.message || `HTTP error! Status: ${response.status}`);
+        }
+
+        const data = await response.json();
+        
+        // Final check before rendering to prevent race conditions
+        if (state.currentRequestId !== requestId) {
+            console.debug('Ignoring outdated request response at render time');
+            return;
+        }
+        
+        itemsContainer.innerHTML = '';
+
+        // Resolve helper functions (fallback to defaults if not provided)
+        const createEl = typeof createItemElement === 'function' ? createItemElement : defaultCreateItemElement;
+        const addPagination = typeof addPaginationControls === 'function' ? addPaginationControls : defaultAddPaginationControls;
+        const addListeners = typeof addItemEventListeners === 'function' ? addItemEventListeners : defaultAddItemEventListeners;
+
+        const items = Array.isArray(data?.data) ? data.data : (Array.isArray(data) ? data : []);
+
+        console.debug('Files API result sample:', items.slice(0, 5).map(i => ({ id: i.id, file_name: i.file_name, name: i.name, is_folder: i.is_folder })));
+
+        if (items.length === 0) {
+            const emptyMessage = query
+            ? `<div class="p-4 text-center text-text-secondary col-span-full">${window.I18N?.fileFolder?.searchResults || 'Search results for:'} <strong>"${query}"</strong></div>`
+            : `<div class="p-4 text-center text-text-secondary col-span-full">${window.I18N?.fileFolder?.noFilesFound || 'No files or folders found.'}</div>`;
+            itemsContainer.innerHTML = emptyMessage;
+            if (data?.last_page > 1) {
+                addPagination(itemsContainer, data);
+            }
+            return;
+        }
+
+        // Show search indicator if searching
+        if (query && query.trim() !== '') {
+            const searchIndicator = document.createElement('div');
+            searchIndicator.className = 'col-span-full mb-4 p-3 bg-[#2A2D47] rounded-lg flex items-center justify-between';
+            searchIndicator.innerHTML = `
+            <div class="flex items-center gap-2 text-sm text-gray-300">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path>
+                </svg>
+                <span>${window.I18N?.fileFolder?.searchResults || 'Search results for:'} <strong>"${query}"</strong> (${items.length} ${items.length === 1 ? (window.I18N?.fileFolder?.item || 'item') : (window.I18N?.fileFolder?.items || 'items')})</span>
+            </div>
+            <button onclick="document.getElementById('mainSearchInput').value = ''; window.loadUserFiles('', 1, localStorage.getItem('currentParentId'));" 
+                    class="text-xs px-3 py-1 bg-[#3C3F58] hover:bg-[#55597C] rounded-lg transition-colors">
+                ${window.I18N?.fileFolder?.clearSearch || 'Clear Search'}
+            </button>
+        `;
+            itemsContainer.appendChild(searchIndicator);
+        }
+
+        // Use our new Google Drive-style renderer instead of the old item-by-item approach
+        renderFiles(items);
+
+        if (data?.last_page > 1) {
+            addPagination(itemsContainer, data);
+        }
+
+    } catch (error) {
+        console.error('Error loading items:', error);
+        if (itemsContainer) {
+            itemsContainer.innerHTML = `
+                <div class="p-4 text-center text-text-secondary col-span-full">
+                    <p class="mb-2">${window.I18N?.fileFolder?.errorLoading || 'Error loading items. Please try again.'}</p>
+                    <p class="text-xs text-red-500">${escapeHtml(error.message || '')}</p>
+                </div>
+            `;
+        }
+    }
+}
+
+// Move functionality
+
+/**
+ * Show move modal for multiple items with conflict resolution
+ */
+async function showMoveModalMulti(itemIds) {
+    try {
+        // Fetch details for all selected items
+        const itemsData = await Promise.all(
+            itemIds.map(id => 
+                fetch(`/files/${id}`, {
+                    headers: {
+                        'Accept': 'application/json',
+                        'X-Requested-With': 'XMLHttpRequest',
+                        'X-CSRF-TOKEN': getCsrfToken()
+                    },
+                    credentials: 'same-origin'
+                }).then(r => r.ok ? r.json() : Promise.reject('Failed to fetch item'))
+                 .then(data => data.data || data)
+                 .catch(() => null)
+            )
+        );
+
+        const validItems = itemsData.filter(item => item !== null);
+        if (validItems.length === 0) {
+            showNotification(window.I18N.fileFolder.msgLoadSelectedFailed, 'error');
+            return;
+        }
+
+        // Create modal
+        const modal = document.createElement('div');
+        modal.className = 'fixed inset-0 bg-black/50 backdrop-blur-sm z-[10000] flex items-center justify-center p-4';
+        modal.innerHTML = `
+            <div class="bg-[#1F2235] border border-[#4A4D6A] rounded-xl max-w-2xl w-full shadow-2xl max-h-[90vh] overflow-y-auto">
+                <div class="p-6">
+                    <div class="flex items-center justify-between mb-4">
+                        <h3 class="text-lg font-semibold text-white">${window.I18N.fileFolder.moveItems} ${validItems.length} ${validItems.length > 1 ? window.I18N.fileFolder.items : window.I18N.fileFolder.item}</h3>
+                        <button type="button" class="text-gray-400 hover:text-white" id="close-move-modal">
+                            <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
+                            </svg>
+                        </button>
+                    </div>
+
+                    <!-- Selected items list -->
+                    <div class="mb-4 bg-[#2A2D47] rounded-lg border border-[#4A4D6A] p-3">
+                        <p class="text-xs text-gray-400 mb-2">${window.I18N.fileFolder.lblSelectedItemsList}</p>
+                        <div class="max-h-32 overflow-y-auto">
+                            ${validItems.map((item, idx) => `
+                                <div class="text-sm text-gray-300 py-1 flex items-center gap-2">
+                                    <svg class="w-4 h-4 ${item.is_folder ? 'text-blue-400' : 'text-gray-400'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="${item.is_folder ? 'M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-5l-2-2H5a2 2 0 00-2 2z' : 'M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z'}"></path>
+                                    </svg>
+                                    <span class="truncate">${escapeHtml(item.file_name)}</span>
+                                </div>
+                            `).join('')}
+                        </div>
+                    </div>
+
+                    <!-- Destination folder selection -->
+                    <div class="mb-4">
+                        <p class="text-sm text-gray-300 mb-3">${window.I18N?.fileFolder?.selectDestination}</p>
+                        <div class="bg-[#2A2D47] rounded-lg border border-[#4A4D6A] max-h-64 overflow-y-auto" id="folder-list">
+                            <div class="p-3 text-center text-gray-400">${window.I18N.fileFolder.lblLoadingFolders}</div>
+                        </div>
+                    </div>
+
+                    <!-- Buttons -->
+                    <div class="flex gap-3 justify-end">
+                        <button type="button" class="px-4 py-2 text-sm font-medium text-gray-300 hover:text-white border border-[#4A4D6A] rounded-lg hover:bg-[#2A2D47] transition-colors" id="cancel-move">
+                            ${window.I18N.fileFolder.cancel}
+                        </button>
+                        <button type="button" class="px-4 py-2 text-sm font-medium bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed" id="confirm-move" disabled>
+                            ${window.I18N.fileFolder.move} ${validItems.length} ${validItems.length > 1 ? window.I18N.fileFolder.items : window.I18N.fileFolder.item}
+                        </button>
+                    </div>
+                </div>
+            </div>
+        `;
+
+        document.body.appendChild(modal);
+
+        // Load folders - pass full item details for multi-item moves
+        await loadFoldersForMove(modal, itemIds, validItems);
+
+        // Event listeners
+        const closeBtn = modal.querySelector('#close-move-modal');
+        const cancelBtn = modal.querySelector('#cancel-move');
+        const confirmBtn = modal.querySelector('#confirm-move');
+
+        const closeModal = () => {
+            modal.remove();
+        };
+
+        closeBtn.addEventListener('click', closeModal);
+        cancelBtn.addEventListener('click', closeModal);
+        modal.addEventListener('click', (e) => {
+            if (e.target === modal) closeModal();
+        });
+
+        confirmBtn.addEventListener('click', async () => {
+            const selectedFolder = modal.querySelector('.folder-item.selected');
+            const destinationId = selectedFolder ? selectedFolder.dataset.folderId : null;
+
+            try {
+                confirmBtn.disabled = true;
+                confirmBtn.textContent = window.I18N.fileFolder.btnMoving;
+
+                await moveItemsBatch(itemIds, destinationId);
+                closeModal();
+
+                // Refresh current view
+                if (window.loadUserFiles) {
+                    window.loadUserFiles(state.lastMainSearch, state.currentPage, state.currentParentId);
+                }
+
+                clearSelection();
+                const msg = window.I18N.fileFolder.msgMoveSuccessMulti.replace(':count', validItems.length);
+                showNotification(msg, 'success');
+            } catch (error) {
+                console.error('Batch move failed:', error);
+                
+                // Handle validation errors with conflict resolution
+                if (error.validationErrors && error.validationErrors.length > 0) {
+                    showConflictResolutionModal(error.validationErrors, itemIds, destinationId);
+                } else {
+                    showNotification(error.message || 'Failed to move items', 'error');
+                    confirmBtn.disabled = false;
+                    confirmBtn.textContent = `Move ${validItems.length} item${validItems.length > 1 ? 's' : ''}`;
+                }
+            }
+        });
+
+    } catch (error) {
+        console.error('Failed to show move modal:', error);
+        showNotification(error.message || window.I18N.fileFolder.msgMoveModalFailed, 'error');
+    }
+}
+
+/**
+ * Show conflict resolution modal for items with naming conflicts
+ */
+function showConflictResolutionModal(conflicts, allItemIds, destinationId) {
+    const modal = document.createElement('div');
+    modal.className = 'fixed inset-0 bg-black/50 backdrop-blur-sm z-[10001] flex items-center justify-center p-4';
+    
+    const conflictItems = conflicts.filter(c => c.error.includes('conflict'));
+    const otherErrors = conflicts.filter(c => !c.error.includes('conflict'));
+
+    modal.innerHTML = `
+        <div class="bg-[#1F2235] border border-[#4A4D6A] rounded-xl max-w-2xl w-full shadow-2xl max-h-[90vh] overflow-y-auto">
+            <div class="p-6">
+                <div class="flex items-center justify-between mb-4">
+                    <h3 class="text-lg font-semibold text-white">${window.I18N.fileFolder.conflictTitle}</h3>
+                    <button type="button" class="text-gray-400 hover:text-white" id="close-conflict-modal">
+                        <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
+                        </svg>
+                    </button>
+                </div>
+
+                <div class="mb-4 p-3 bg-yellow-900/20 border border-yellow-700/30 rounded-lg">
+                    <p class="text-sm text-yellow-200">
+                        ${window.I18N.fileFolder.conflictDesc.replace(':count', conflictItems.length)}
+                        ${otherErrors.length > 0 ? `<br>${window.I18N.fileFolder.conflictCannotMove.replace(':count', otherErrors.length)}` : ''}
+                    </p>
+                </div>
+
+                <!-- Conflict items -->
+                <div class="mb-4 max-h-64 overflow-y-auto">
+                    ${conflictItems.map((conflict, idx) => `
+                        <div class="mb-3 p-3 bg-[#2A2D47] rounded-lg border border-[#4A4D6A]">
+                            <div class="flex items-center justify-between mb-2">
+                                <span class="text-sm text-gray-300"><strong>${escapeHtml(conflict.file_name)}</strong></span>
+                                <span class="text-xs text-yellow-400">Name conflict</span>
+                            </div>
+                            <div class="text-xs text-gray-400 mb-2">${window.I18N.fileFolder.conflictExisting} ${escapeHtml(conflict.conflict_item?.file_name || 'Unknown')}</div>
+                            <div class="flex gap-2">
+                                <button class="conflict-skip text-xs px-2 py-1 bg-gray-600 hover:bg-gray-700 text-white rounded transition-colors" data-item-id="${conflict.item_id}">
+                                    ${window.I18N.fileFolder.skip}
+                                </button>
+                                <button class="conflict-rename text-xs px-2 py-1 bg-blue-600 hover:bg-blue-700 text-white rounded transition-colors" data-item-id="${conflict.item_id}" data-file-name="${escapeHtml(conflict.file_name)}">
+                                    ${window.I18N.fileFolder.conflictRename}
+                                </button>
+                                <button class="conflict-replace text-xs px-2 py-1 bg-red-600 hover:bg-red-700 text-white rounded transition-colors" data-item-id="${conflict.item_id}">
+                                    ${window.I18N.fileFolder.conflictReplace}
+                                </button>
+                            </div>
+                        </div>
+                    `).join('')}
+                </div>
+
+                <!-- Other errors -->
+                ${otherErrors.length > 0 ? `
+                    <div class="mb-4 p-3 bg-red-900/20 border border-red-700/30 rounded-lg">
+                        <p class="text-sm text-red-200 mb-2">Items that cannot be moved:</p>
+                        <ul class="text-xs text-red-300">
+                            ${otherErrors.map(err => `<li>• ${escapeHtml(err.file_name || 'Unknown')}: ${err.error}</li>`).join('')}
+                        </ul>
+                    </div>
+                ` : ''}
+
+                <!-- Buttons -->
+                <div class="flex gap-3 justify-end">
+                    <button type="button" class="px-4 py-2 text-sm font-medium text-gray-300 hover:text-white border border-[#4A4D6A] rounded-lg hover:bg-[#2A2D47] transition-colors" id="cancel-conflict">
+                        ${window.I18N.fileFolder.cancel}
+                    </button>
+                    <button type="button" class="px-4 py-2 text-sm font-medium bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition-colors" id="proceed-conflict">
+                        ${window.I18N.fileFolder.proceed}
+                    </button>
+                </div>
+            </div>
+        </div>
+    `;
+
+    document.body.appendChild(modal);
+
+    const conflictChoices = {};
+    conflictItems.forEach(c => {
+        conflictChoices[c.item_id] = 'skip'; // default
+    });
+
+    // Event handlers for conflict resolution buttons
+    modal.querySelectorAll('.conflict-skip').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            e.preventDefault();
+            const itemId = btn.dataset.itemId;
+            conflictChoices[itemId] = 'skip';
+            updateConflictButtonStates(modal, conflictChoices);
+        });
+    });
+
+    modal.querySelectorAll('.conflict-rename').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            e.preventDefault();
+            const itemId = btn.dataset.itemId;
+            const fileName = btn.dataset.fileName;
+            const msg = window.I18N.fileFolder.promptRename.replace(':name', fileName);
+            const newName = prompt(msg, `${fileName} (1)`);
+            if (newName && newName.trim()) {
+                conflictChoices[itemId] = { action: 'rename', newName: newName.trim() };
+                updateConflictButtonStates(modal, conflictChoices);
+            }
+        });
+    });
+
+    modal.querySelectorAll('.conflict-replace').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            e.preventDefault();
+            const itemId = btn.dataset.itemId;
+            if (confirm('This will delete the existing file. Are you sure?')) {
+                conflictChoices[itemId] = 'replace';
+                updateConflictButtonStates(modal, conflictChoices);
+            }
+        });
+    });
+
+    // Close handlers
+    const closeModal = () => modal.remove();
+    modal.querySelector('#close-conflict-modal').addEventListener('click', closeModal);
+    modal.querySelector('#cancel-conflict').addEventListener('click', closeModal);
+
+    modal.querySelector('#proceed-conflict').addEventListener('click', async () => {
+        try {
+            modal.querySelector('#proceed-conflict').disabled = true;
+            modal.querySelector('#proceed-conflict').textContent = window.I18N.fileFolder.btnProcessing;
+
+            // For now, just skip conflicted items and move the rest
+            const itemsToMove = allItemIds.filter(id => !conflictChoices[id] || conflictChoices[id] === 'skip');
+            
+            if (itemsToMove.length === 0) {
+                showNotification(window.I18N.fileFolder.msgNoItemsMove, 'info');
+                closeModal();
+                return;
+            }
+
+            await moveItemsBatch(itemsToMove, destinationId);
+            closeModal();
+
+            if (window.loadUserFiles) {
+                window.loadUserFiles(state.lastMainSearch, state.currentPage, state.currentParentId);
+            }
+
+            clearSelection();
+            showNotification(`${itemsToMove.length} item${itemsToMove.length > 1 ? 's' : ''} moved successfully`, 'success');
+        } catch (error) {
+            console.error('Conflict resolution move failed:', error);
+            showNotification(error.message || 'Failed to move items', 'error');
+            modal.querySelector('#proceed-conflict').disabled = false;
+            modal.querySelector('#proceed-conflict').textContent = 'Proceed with Selected Options';
+        }
+    });
+}
+
+/**
+ * Update visual state of conflict buttons
+ */
+function updateConflictButtonStates(modal, choices) {
+    Object.entries(choices).forEach(([itemId, choice]) => {
+        const skipBtn = modal.querySelector(`.conflict-skip[data-item-id="${itemId}"]`);
+        const renameBtn = modal.querySelector(`.conflict-rename[data-item-id="${itemId}"]`);
+        const replaceBtn = modal.querySelector(`.conflict-replace[data-item-id="${itemId}"]`);
+
+        [skipBtn, renameBtn, replaceBtn].forEach(btn => {
+            if (btn) btn.classList.remove('ring-2', 'ring-green-500');
+        });
+
+        if (choice === 'skip' && skipBtn) {
+            skipBtn.classList.add('ring-2', 'ring-green-500');
+        } else if (choice === 'replace' && replaceBtn) {
+            replaceBtn.classList.add('ring-2', 'ring-green-500');
+        } else if (typeof choice === 'object' && choice.action === 'rename' && renameBtn) {
+            renameBtn.classList.add('ring-2', 'ring-green-500');
+            // Use new localizer or fallback
+            const msg = window.I18N.fileFolder.lblRenameTo || 'Rename to ":name"';
+            renameBtn.textContent = msg.replace(':name', choice.newName);
+        }
+    });
+}
+
+async function showMoveModal(itemId) {
+    try {
+        // Get item details first
+        const itemResponse = await fetch(`/files/${itemId}`, {
+            headers: {
+                'Accept': 'application/json',
+                'X-Requested-With': 'XMLHttpRequest',
+                'X-CSRF-TOKEN': getCsrfToken()
+            },
+            credentials: 'same-origin'
+        });
+
+        if (!itemResponse.ok) {
+            throw new Error('Failed to get item details');
+        }
+
+        const itemData = await itemResponse.json();
+        const item = itemData.data || itemData;
+
+        // Create modal
+        const modal = document.createElement('div');
+        modal.className = 'fixed inset-0 bg-black/50 backdrop-blur-sm z-[10000] flex items-center justify-center p-4';
+        modal.innerHTML = `
+            <div class="bg-[#1F2235] border border-[#4A4D6A] rounded-xl max-w-md w-full shadow-2xl">
+                <div class="p-6">
+                    <div class="flex items-center justify-between mb-4">
+                        <h3 class="text-lg font-semibold text-white">${window.I18N.fileFolder.move} "${escapeHtml(item.file_name || item.name)}"</h3>
+                        <button type="button" class="text-gray-400 hover:text-white" id="close-move-modal">
+                            <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
+                            </svg>
+                        </button>
+                    </div>
+                    
+                    <div class="mb-4">
+                        <p class="text-sm text-gray-300 mb-3">${window.I18N.fileFolder.selectDestination}</p>
+                        <div class="bg-[#2A2D47] rounded-lg border border-[#4A4D6A] max-h-64 overflow-y-auto" id="folder-list">
+                            <div class="p-3 text-center text-gray-400">${window.I18N.fileFolder.lblLoadingFolders}</div>
+                        </div>
+                    </div>
+                    
+                    <div class="flex gap-3 justify-end">
+                        <button type="button" class="px-4 py-2 text-sm font-medium text-gray-300 hover:text-white border border-[#4A4D6A] rounded-lg hover:bg-[#2A2D47] transition-colors" id="cancel-move">
+                            ${window.I18N.fileFolder.cancel}
+                        </button>
+                        <button type="button" class="px-4 py-2 text-sm font-medium bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed" id="confirm-move" disabled>
+                            ${window.I18N.fileFolder.moveHere}
+                        </button>
+                    </div>
+                </div>
+            </div>
+        `;
+
+        document.body.appendChild(modal);
+
+        // Load folders - pass item details so we can exclude it and its descendants
+        await loadFoldersForMove(modal, itemId, item);
+
+        // Event listeners
+        const closeBtn = modal.querySelector('#close-move-modal');
+        const cancelBtn = modal.querySelector('#cancel-move');
+        const confirmBtn = modal.querySelector('#confirm-move');
+
+        const closeModal = () => {
+            modal.remove();
+        };
+
+        closeBtn.addEventListener('click', closeModal);
+        cancelBtn.addEventListener('click', closeModal);
+        modal.addEventListener('click', (e) => {
+            if (e.target === modal) closeModal();
+        });
+
+        confirmBtn.addEventListener('click', async () => {
+            const selectedFolder = modal.querySelector('.folder-item.selected');
+            const destinationId = selectedFolder ? selectedFolder.dataset.folderId : null;
+            
+            try {
+                confirmBtn.disabled = true;
+                confirmBtn.textContent = window.I18N.fileFolder.btnMoving;
+                
+                await moveItem(itemId, destinationId);
+                closeModal();
+                
+                // Refresh current view
+                if (window.loadUserFiles) {
+                    window.loadUserFiles(state.lastMainSearch, state.currentPage, state.currentParentId);
+                }
+                
+                showNotification(window.I18N.fileFolder.msgMoveSuccess, 'success');
+            } catch (error) {
+                console.error('Move failed:', error);
+                showNotification(error.message || window.I18N.fileFolder.msgMoveFailed, 'error');
+                confirmBtn.disabled = false;
+                confirmBtn.textContent = window.I18N.fileFolder.moveHere;
+            }
+        });
+
+    } catch (error) {
+        console.error('Failed to show move modal:', error);
+        showNotification(error.message || window.I18N.fileFolder.msgMoveModalFailed, 'error');
+    }
+}
+
+async function loadFoldersForMove(modal, itemIdOrIds, itemDetails = null) {
+    const folderList = modal.querySelector('#folder-list');
+    
+    try {
+        // Get all folders for the current user
+        const response = await fetch('/files?type=folders', {
+            headers: {
+                'Accept': 'application/json',
+                'X-Requested-With': 'XMLHttpRequest',
+                'X-CSRF-TOKEN': getCsrfToken()
+            },
+            credentials: 'same-origin'
+        });
+
+        if (!response.ok) {
+            throw new Error('Failed to load folders');
+        }
+
+        const data = await response.json();
+        const folders = Array.isArray(data?.data) ? data.data : (Array.isArray(data) ? data : []);
+
+        // Handle both single item and multiple items
+        const itemIds = Array.isArray(itemIdOrIds) ? itemIdOrIds : [itemIdOrIds];
+        
+        // Build a set of IDs to exclude (items being moved + their descendants)
+        const excludedIds = new Set();
+        const excludedNames = new Set();
+        
+        // Get item details array (handle both single object and array)
+        let itemDetailsArray = [];
+        if (Array.isArray(itemDetails)) {
+            itemDetailsArray = itemDetails;
+        } else if (itemDetails && itemDetails.id) {
+            itemDetailsArray = [itemDetails];
+        }
+        
+        // Add all items being moved to excluded set (by ID and name)
+        itemDetailsArray.forEach(item => {
+            if (item && item.id) {
+                excludedIds.add(item.id);
+                if (item.file_name) {
+                    excludedNames.add(item.file_name);
+                }
+            }
+        });
+        
+        // Also add by itemIds in case details weren't provided
+        itemIds.forEach(id => excludedIds.add(id));
+        
+        // For each folder being moved, add all its descendants to excluded set
+        const addDescendants = (parentId) => {
+            folders.forEach(folder => {
+                if (folder.parent_id === parentId && !excludedIds.has(folder.id)) {
+                    excludedIds.add(folder.id);
+                    addDescendants(folder.id);
+                }
+            });
+        };
+        
+        // Add descendants for all excluded items
+        excludedIds.forEach(id => {
+            addDescendants(id);
+        });
+        
+        // Filter out excluded folders (by ID or name match)
+        const availableFolders = folders.filter(folder => 
+            !excludedIds.has(folder.id) && !excludedNames.has(folder.file_name)
+        );
+
+        folderList.innerHTML = '';
+
+        // Build tree structure: map of parentId -> [children]
+        // Normalize all parent_id values to ensure consistent key types
+        const folderTree = {};
+        availableFolders.forEach(folder => {
+            // Normalize parent_id: null/undefined -> 'null', otherwise use as-is
+            const parentId = folder.parent_id === null || folder.parent_id === undefined ? 'null' : folder.parent_id;
+            // Normalize folder.id for consistency
+            folder._normalizedId = folder.id;
+            
+            if (!folderTree[parentId]) {
+                folderTree[parentId] = [];
+            }
+            folderTree[parentId].push(folder);
+        });
+
+        // Debug: Log tree structure
+        console.log('🌳 [TREE] Available folders:', availableFolders.length);
+        console.log('🌳 [TREE] Folder tree structure:', folderTree);
+        Object.keys(folderTree).forEach(parentId => {
+            console.log(`🌳 [TREE] Parent ${parentId} has ${folderTree[parentId].length} children:`, folderTree[parentId].map(f => f.file_name));
+        });
+
+        // Sort folders by name within each level
+        Object.keys(folderTree).forEach(parentId => {
+            folderTree[parentId].sort((a, b) => 
+                (a.file_name || a.name).localeCompare(b.file_name || b.name)
+            );
+        });
+
+        // Add root folder option
+        const rootOption = document.createElement('div');
+        rootOption.className = 'folder-item flex items-center p-3 hover:bg-[#3C3F58] cursor-pointer border-b border-[#4A4D6A]';
+        rootOption.dataset.folderId = 'null';
+        rootOption.style.paddingLeft = '0.75rem';
+        rootOption.innerHTML = `
+            <svg class="w-5 h-5 text-blue-400 mr-3 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-5l-2-2H5a2 2 0 00-2 2z"></path>
+            </svg>
+            <span class="text-gray-200">${window.I18N?.fileFolder?.rootFolder || 'Root Folder'}</span>
+        `;
+        folderList.appendChild(rootOption);
+
+        // Recursively render folder tree
+        const renderFolderTree = (parentId, depth = 0) => {
+            const children = folderTree[parentId] || [];
+            
+            children.forEach((folder, index) => {
+                // Check if this folder has children by looking it up in the tree
+                let hasChildren = folderTree[folder.id] && folderTree[folder.id].length > 0;
+                const isLast = index === children.length - 1;
+                
+                // Debug: log folder check
+                console.log(`🌳 [TREE] Checking folder "${folder.file_name}" (ID: ${folder.id}), hasChildren: ${hasChildren}, folderTree[${folder.id}]:`, folderTree[folder.id]);
+                
+                // Debug: log if folder should have children but doesn't
+                if (folder.id && !hasChildren && folderTree[folder.id] === undefined) {
+                    // Try to find children with string ID in case of type mismatch
+                    const stringId = String(folder.id);
+                    console.log(`🌳 [TREE] Trying string ID "${stringId}", found:`, folderTree[stringId]);
+                    if (folderTree[stringId] && folderTree[stringId].length > 0) {
+                        // Type mismatch detected, use string ID
+                        console.log(`🌳 [TREE] Type mismatch! Using string ID for folder "${folder.file_name}"`);
+                        folderTree[folder.id] = folderTree[stringId];
+                        hasChildren = true;
+                    }
+                }
+                
+                // Create folder item
+                const folderItem = document.createElement('div');
+                folderItem.className = 'folder-item flex items-center hover:bg-[#3C3F58] cursor-pointer border-b border-[#4A4D6A] group';
+                folderItem.dataset.folderId = folder.id;
+                folderItem.style.paddingLeft = `${0.75 + depth * 1.5}rem`;
+                
+                const paddingClass = isLast ? '' : 'border-l border-[#4A4D6A]';
+                
+                folderItem.innerHTML = `
+                    <div class="flex items-center w-full py-2">
+                        ${hasChildren ? `
+                            <button class="folder-toggle w-5 h-5 mr-1 flex items-center justify-center hover:bg-[#2A2D47] rounded transition-colors flex-shrink-0" data-folder-id="${folder.id}">
+                                <svg class="w-4 h-4 text-gray-400 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"></path>
+                                </svg>
+                            </button>
+                        ` : `
+                            <div class="w-5 mr-1 flex-shrink-0"></div>
+                        `}
+                        <svg class="w-5 h-5 text-blue-400 mr-2 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-5l-2-2H5a2 2 0 00-2 2z"></path>
+                        </svg>
+                        <span class="text-gray-200 truncate">${escapeHtml(folder.file_name || folder.name)}</span>
+                    </div>
+                `;
+                
+                folderList.appendChild(folderItem);
+                
+                // Add toggle handler for expandable folders
+                if (hasChildren) {
+                    const toggleBtn = folderItem.querySelector('.folder-toggle');
+                    toggleBtn.addEventListener('click', (e) => {
+                        e.stopPropagation();
+                        const isExpanded = toggleBtn.dataset.expanded === 'true';
+                        toggleBtn.dataset.expanded = !isExpanded;
+                        
+                        // Rotate arrow
+                        const svg = toggleBtn.querySelector('svg');
+                        svg.style.transform = isExpanded ? 'rotate(0deg)' : 'rotate(90deg)';
+                        
+                        // Toggle children visibility
+                        const childrenContainer = folderItem.nextElementSibling;
+                        if (childrenContainer && childrenContainer.classList.contains('folder-children')) {
+                            childrenContainer.style.display = isExpanded ? 'none' : 'block';
+                        }
+                    });
+                    
+                    // Create container for children
+                    const childrenContainer = document.createElement('div');
+                    childrenContainer.className = 'folder-children';
+                    childrenContainer.style.display = 'none';
+                    folderList.appendChild(childrenContainer);
+                    
+                    // Temporarily switch context to render children into container
+                    const originalParent = folderList;
+                    const tempParent = childrenContainer;
+                    const oldAppendChild = tempParent.appendChild.bind(tempParent);
+                    
+                    // Render children
+                    const childrenHTML = [];
+                    const renderChildren = (parentId, depth) => {
+                        const children = folderTree[parentId] || [];
+                        children.forEach((child, idx) => {
+                            const hasGrandchildren = folderTree[child.id] && folderTree[child.id].length > 0;
+                            const isLastChild = idx === children.length - 1;
+                            
+                            const childItem = document.createElement('div');
+                            childItem.className = 'folder-item flex items-center hover:bg-[#3C3F58] cursor-pointer border-b border-[#4A4D6A]';
+                            childItem.dataset.folderId = child.id;
+                            childItem.style.paddingLeft = `${0.75 + depth * 1.5}rem`;
+                            
+                            childItem.innerHTML = `
+                                <div class="flex items-center w-full py-2">
+                                    ${hasGrandchildren ? `
+                                        <button class="folder-toggle w-5 h-5 mr-1 flex items-center justify-center hover:bg-[#2A2D47] rounded transition-colors flex-shrink-0" data-folder-id="${child.id}">
+                                            <svg class="w-4 h-4 text-gray-400 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"></path>
+                                            </svg>
+                                        </button>
+                                    ` : `
+                                        <div class="w-5 mr-1 flex-shrink-0"></div>
+                                    `}
+                                    <svg class="w-5 h-5 text-blue-400 mr-2 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-5l-2-2H5a2 2 0 00-2 2z"></path>
+                                    </svg>
+                                    <span class="text-gray-200 truncate">${escapeHtml(child.file_name || child.name)}</span>
+                                </div>
+                            `;
+                            
+                            tempParent.appendChild(childItem);
+                            
+                            // Add toggle for grandchildren
+                            if (hasGrandchildren) {
+                                const toggleBtn = childItem.querySelector('.folder-toggle');
+                                toggleBtn.addEventListener('click', (e) => {
+                                    e.stopPropagation();
+                                    const isExp = toggleBtn.dataset.expanded === 'true';
+                                    toggleBtn.dataset.expanded = !isExp;
+                                    const svg = toggleBtn.querySelector('svg');
+                                    svg.style.transform = isExp ? 'rotate(0deg)' : 'rotate(90deg)';
+                                    
+                                    const nextContainer = childItem.nextElementSibling;
+                                    if (nextContainer && nextContainer.classList.contains('folder-children')) {
+                                        nextContainer.style.display = isExp ? 'none' : 'block';
+                                    }
+                                });
+                                
+                                const grandchildContainer = document.createElement('div');
+                                grandchildContainer.className = 'folder-children';
+                                grandchildContainer.style.display = 'none';
+                                tempParent.appendChild(grandchildContainer);
+                                
+                                // Render grandchildren recursively
+                                renderGrandchildren(child.id, depth + 1, grandchildContainer);
+                            }
+                        });
+                    };
+                    
+                    const renderGrandchildren = (parentId, depth, container) => {
+                        const children = folderTree[parentId] || [];
+                        children.forEach((child, idx) => {
+                            const hasGrandchildren = folderTree[child.id] && folderTree[child.id].length > 0;
+                            
+                            const item = document.createElement('div');
+                            item.className = 'folder-item flex items-center hover:bg-[#3C3F58] cursor-pointer border-b border-[#4A4D6A]';
+                            item.dataset.folderId = child.id;
+                            item.style.paddingLeft = `${0.75 + depth * 1.5}rem`;
+                            
+                            item.innerHTML = `
+                                <div class="flex items-center w-full py-2">
+                                    ${hasGrandchildren ? `
+                                        <button class="folder-toggle w-5 h-5 mr-1 flex items-center justify-center hover:bg-[#2A2D47] rounded transition-colors flex-shrink-0" data-folder-id="${child.id}">
+                                            <svg class="w-4 h-4 text-gray-400 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"></path>
+                                            </svg>
+                                        </button>
+                                    ` : `
+                                        <div class="w-5 mr-1 flex-shrink-0"></div>
+                                    `}
+                                    <svg class="w-5 h-5 text-blue-400 mr-2 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-5l-2-2H5a2 2 0 00-2 2z"></path>
+                                    </svg>
+                                    <span class="text-gray-200 truncate">${escapeHtml(child.file_name || child.name)}</span>
+                                </div>
+                            `;
+                            
+                            container.appendChild(item);
+                            
+                            if (hasGrandchildren) {
+                                const toggleBtn = item.querySelector('.folder-toggle');
+                                toggleBtn.addEventListener('click', (e) => {
+                                    e.stopPropagation();
+                                    const isExp = toggleBtn.dataset.expanded === 'true';
+                                    toggleBtn.dataset.expanded = !isExp;
+                                    const svg = toggleBtn.querySelector('svg');
+                                    svg.style.transform = isExp ? 'rotate(0deg)' : 'rotate(90deg)';
+                                    
+                                    const nextCont = item.nextElementSibling;
+                                    if (nextCont && nextCont.classList.contains('folder-children')) {
+                                        nextCont.style.display = isExp ? 'none' : 'block';
+                                    }
+                                });
+                                
+                                const deepContainer = document.createElement('div');
+                                deepContainer.className = 'folder-children';
+                                deepContainer.style.display = 'none';
+                                container.appendChild(deepContainer);
+                                renderGrandchildren(child.id, depth + 1, deepContainer);
+                            }
+                        });
+                    };
+                    
+                    renderChildren(folder.id, depth + 1);
+                }
+            });
+        };
+
+        // Render root level folders
+        renderFolderTree('null', 0);
+
+        if (availableFolders.length === 0) {
+            const noFolders = document.createElement('div');
+            noFolders.className = 'p-3 text-center text-gray-400';
+            noFolders.textContent = window.I18N?.fileFolder?.noFolders || 'No folders available. You can only move to root folder.';
+            folderList.appendChild(noFolders);
+        }
+
+        // Add click handlers for folder selection (event delegation)
+        folderList.addEventListener('click', (e) => {
+            // Ensure we're working with an element, not a text node
+            if (e.target.nodeType !== 1) return; // 1 = ELEMENT_NODE
+            
+            const folderItem = e.target.closest('.folder-item');
+            const isToggleButton = e.target.closest('.folder-toggle');
+            
+            // Only select if clicking on folder item, not on toggle button
+            if (folderItem && !isToggleButton) {
+                // Remove previous selection
+                folderList.querySelectorAll('.folder-item').forEach(item => {
+                    item.classList.remove('selected', 'bg-blue-600');
+                });
+                
+                // Add selection to clicked item
+                folderItem.classList.add('selected', 'bg-blue-600');
+                
+                // Enable confirm button
+                const confirmBtn = modal.querySelector('#confirm-move');
+                confirmBtn.disabled = false;
+            }
+        });
+
+    } catch (error) {
+        console.error('Failed to load folders:', error);
+        folderList.innerHTML = `
+            <div class="p-3 text-center text-red-400">
+                ${window.I18N.fileFolder.msgLoadFoldersFailed}
+            </div>
+        `;
+    }
+}
+
+async function moveItem(itemId, destinationId) {
+    const response = await fetch(`/files/${itemId}/move`, {
+        method: 'PATCH',
+        headers: {
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+            'X-Requested-With': 'XMLHttpRequest',
+            'X-CSRF-TOKEN': getCsrfToken()
+        },
+        credentials: 'same-origin',
+        body: JSON.stringify({
+            parent_id: destinationId === 'null' ? null : parseInt(destinationId)
+        })
+    });
+
+    if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(errorData.message || `Failed to move item (${response.status})`);
+    }
+
+    return response.json();
+}
+
+/**
+ * Move multiple items in a batch (transactional)
+ */
+async function moveItemsBatch(itemIds, destinationId) {
+    const response = await fetch('/files/move-batch', {
+        method: 'POST',
+        headers: {
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+            'X-Requested-With': 'XMLHttpRequest',
+            'X-CSRF-TOKEN': getCsrfToken()
+        },
+        credentials: 'same-origin',
+        body: JSON.stringify({
+            item_ids: itemIds,
+            parent_id: destinationId === 'null' ? null : parseInt(destinationId)
+        })
+    });
+
+    if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        
+        // If validation errors exist, throw them with details
+        if (errorData.validation_errors) {
+            const error = new Error(errorData.message || 'Validation failed for some items');
+            error.validationErrors = errorData.validation_errors;
+            throw error;
+        }
+        
+        throw new Error(errorData.message || `Failed to move items (${response.status})`);
+    }
+
+    return response.json();
+}
+
+// OTP Security Modal
+function showOtpSecurityModal(fileId) {
+    // Remove any existing modal
+    const existingModal = document.getElementById('otpSecurityModal');
+    if (existingModal) {
+        existingModal.remove();
+    }
+
+    // Create modal HTML
+    const modal = document.createElement('div');
+    modal.id = 'otpSecurityModal';
+    modal.className = 'fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50';
+    modal.innerHTML = `
+        <div class="bg-[#1F2235] rounded-lg p-6 w-full max-w-md mx-4 border border-[#3C3F58]">
+            <div class="flex justify-between items-center mb-4">
+                <h3 class="text-lg font-medium text-white">${window.I18N.fileFolder.otpSettingsTitle}</h3>
+                <button id="closeOtpModal" class="text-gray-400 hover:text-white">
+                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                </button>
+            </div>
+
+            <div id="otpSecurityContent">
+                <div class="flex items-center justify-center py-8">
+                    <div class="animate-spin w-6 h-6 border-2 border-[#f89c00] border-t-transparent rounded-full"></div>
+                    <span class="ml-2 text-gray-400">${window.I18N.fileFolder.loading}</span>
+                </div>
+            </div>
+        </div>
+    `;
+
+    document.body.appendChild(modal);
+
+    // Close modal handlers
+    const closeModal = () => modal.remove();
+    modal.querySelector('#closeOtpModal').addEventListener('click', closeModal);
+    modal.addEventListener('click', (e) => {
+        if (e.target === modal) closeModal();
+    });
+
+    // Load OTP status and render content
+    loadOtpStatus(fileId);
+}
+
+async function loadOtpStatus(fileId) {
+    try {
+        // First check if user can access OTP features (email verification)
+        const accessResponse = await fetch('/file-otp/check-access', {
+            method: 'GET',
+            headers: {
+                'Accept': 'application/json',
+                'X-Requested-With': 'XMLHttpRequest',
+                'X-CSRF-TOKEN': getCsrfToken()
+            },
+            credentials: 'same-origin'
+        });
+
+        const accessResult = await accessResponse.json();
+        
+        if (!accessResult.success || !accessResult.can_use_otp) {
+            // Show email verification required message
+            const content = document.getElementById('otpSecurityContent');
+            if (content) {
+                content.innerHTML = `
+                    <div class="text-center py-6">
+                        <div class="w-16 h-16 bg-yellow-100 rounded-full flex items-center justify-center mx-auto mb-4">
+                            <svg class="w-8 h-8 text-yellow-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.732-.833-2.502 0L3.349 16.5c-.77.833.192 2.5 1.732 2.5z"></path>
+                            </svg>
+                        </div>
+                        <h3 class="text-lg font-semibold text-white mb-2">${window.I18N.fileFolder.msgEmailVerifyReq}</h3>
+                        <p class="text-gray-400 text-sm mb-4">${accessResult.message}</p>
+                        <div class="space-y-3">
+                             <a href="/profile" 
+                               class="inline-block px-4 py-2 bg-[#f89c00] text-white rounded-lg hover:bg-[#e6890d] transition-colors">
+                                ${window.I18N.fileFolder.btnVerifyEmail}
+                             </a>
+                            <div class="text-xs text-gray-500">
+                                ${window.I18N.fileFolder.msgEmailVerifyDesc}
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }
+            return;
+        }
+
+        // User is verified, proceed with normal OTP status loading
+        const response = await fetch(`/file-otp/status?file_type=regular&file_id=${fileId}`, {
+            method: 'GET',
+            headers: {
+                'Accept': 'application/json',
+                'X-Requested-With': 'XMLHttpRequest',
+                'X-CSRF-TOKEN': getCsrfToken()
+            },
+            credentials: 'same-origin'
+        });
+
+        const result = await response.json();
+        
+        if (result.success) {
+            renderOtpSecurityContent(fileId, result);
+        } else {
+            throw new Error(result.message || 'Failed to load OTP status');
+        }
+    } catch (error) {
+        console.error('Failed to load OTP status:', error);
+        const content = document.getElementById('otpSecurityContent');
+        if (content) {
+            content.innerHTML = `
+                <div class="text-center py-4">
+                    <div class="text-red-400 mb-2">Failed to load OTP settings</div>
+                    <button onclick="loadOtpStatus(${fileId})" class="text-[#f89c00] hover:text-[#e88900] text-sm">Try Again</button>
+                </div>
+            `;
+        }
+    }
+}
+
+function renderOtpSecurityContent(fileId, otpData) {
+    const content = document.getElementById('otpSecurityContent');
+    if (!content) return;
+
+    const isEnabled = otpData.otp_enabled;
+    
+    content.innerHTML = `
+        <div class="space-y-4">
+            <div class="flex items-center justify-between p-3 bg-[#2A2A3E] rounded-lg">
+                <div>
+                    <div class="text-white font-medium">${window.I18N.fileFolder.emailOtpProtection}</div>
+                    <div class="text-sm text-gray-400">${window.I18N.fileFolder.otpRequireDesc}</div>
+                </div>
+                <label class="relative inline-flex items-center cursor-pointer">
+                    <input type="checkbox" id="otpToggle" class="sr-only peer" ${isEnabled ? 'checked' : ''}>
+                    <div class="w-11 h-6 bg-gray-600 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-[#f89c00]"></div>
+                </label>
+            </div>
+
+            ${!isEnabled ? `
+                <div class="p-3 bg-yellow-900/20 border border-yellow-500/30 rounded-lg">
+                    <div class="text-yellow-400 text-sm font-medium mb-2">⚠️ ${window.I18N.fileFolder.importantNotice}</div>
+                        <div class="text-yellow-300 text-xs space-y-2">
+                            <p>${window.I18N.fileFolder.otpWarningDesc}</p>
+    
+                            <ul class="list-disc list-inside ml-1 space-y-1">
+                                <li>${window.I18N.fileFolder.otpWarningList1}</li>
+                                <li>${window.I18N.fileFolder.otpWarningList2}</li>
+                                <li>${window.I18N.fileFolder.otpWarningList3}</li>
+                                <li>${window.I18N.fileFolder.otpWarningList4}</li>
+                            </ul>
+            
+                            <p class="mt-2">${window.I18N.fileFolder.otpWarningFooter}</p>
+                        </div>
+                    </div>
+            ` : ''}
+
+            ${isEnabled ? `
+                <div class="space-y-3">
+                    <div class="grid grid-cols-2 gap-3">
+                        <label class="flex items-center">
+                            <input type="checkbox" id="requireDownload" class="mr-2 text-[#f89c00] bg-[#2A2A3E] 
+                            border-[#3C3F58] rounded focus:ring-[#f89c00]" ${otpData.require_otp_for_download ? 'checked' : ''}>
+                            <span class="text-sm text-gray-300">${window.I18N.fileFolder.requireDownload}</span>
+                        </label>
+                        <label class="flex items-center">
+                            <input type="checkbox" id="requirePreview" class="mr-2 text-[#f89c00] bg-[#2A2A3E] border-[#3C3F58] rounded focus:ring-[#f89c00]" ${otpData.require_otp_for_preview ?
+                            'checked' : ''}>
+                            <span class="text-sm text-gray-300">${window.I18N.fileFolder.requirePreview}</span>
+                        </label>
+                    </div>
+
+                    <div class="p-3 bg-blue-900/20 border border-blue-500/30 rounded-lg">
+                        <div class="text-blue-400 text-sm font-medium mb-2">🔒 ${window.I18N.fileFolder.sharedLinkManagement}</div>
+                        <div class="text-blue-300 text-xs mb-3">${window.I18N.fileFolder.deleteSharedLinkDesc}</div>
+                        <button id="deleteSharedLink" class="w-full px-3 py-2 bg-blue-600 text-white text-xs rounded hover:bg-blue-700 transition-colors">
+                            ${window.I18N.fileFolder.deleteSharedLinkBtn}
+                        </button>
+                    </div>
+
+                    <div class="p-3 bg-red-900/20 border border-red-500/30 rounded-lg">
+                        <div class="text-red-400 text-sm font-medium mb-2">⚠️ ${window.I18N.fileFolder.disableOtpHeader}</div>
+                        <div class="text-red-300 text-xs mb-3">${window.I18N.fileFolder.disableOtpDesc}</div>
+                        <div class="flex gap-2">
+                            <button id="sendDisableOtp" class="px-3 py-1 bg-red-600 text-white text-xs rounded hover:bg-red-700 transition-colors">
+                                ${window.I18N.fileFolder.sendOtp}
+                            </button>
+                            <input type="text" id="disableOtpCode" placeholder="${window.I18N.fileFolder.phEnterOtp}" maxlength="6" class="px-2 py-1 bg-[#2A2A3E] border border-[#3C3F58] rounded text-white text-xs flex-1" disabled>
+                   
+                            <button id="confirmDisableOtp" class="px-3 py-1 bg-red-600 text-white text-xs rounded hover:bg-red-700 transition-colors" disabled>
+                                ${window.I18N.fileFolder.disable}
+                            </button>
+                        </div>
+                    </div>
+
+                    <div>
+                        <label class="block text-sm text-gray-300 mb-1">${window.I18N.fileFolder.otpDuration}</label>
+                        <select id="otpDuration" class="w-full px-3 py-2 bg-[#2A2A3E] border border-[#3C3F58] rounded-md text-white focus:border-[#f89c00] focus:ring-1 focus:ring-[#f89c00]">
+                            <option value="5" ${otpData.otp_valid_duration_minutes === 5 ? 'selected' : ''}>5 ${window.I18N.fileFolder.lblMinutes}</option>
+                            <option value="10" ${otpData.otp_valid_duration_minutes === 10 ? 'selected' : ''}>10 ${window.I18N.fileFolder.lblMinutes}</option>
+                            <option value="15" ${otpData.otp_valid_duration_minutes === 15 ? 'selected' : ''}>15 ${window.I18N.fileFolder.lblMinutes}</option>
+                            <option value="30" ${otpData.otp_valid_duration_minutes === 30 ? 'selected' : ''}>30 ${window.I18N.fileFolder.lblMinutes}</option>
+                            <option value="60" ${otpData.otp_valid_duration_minutes === 60 ? 'selected' : ''}>60 ${window.I18N.fileFolder.lblMinutes}</option>
+                        </select>
+                    </div>
+
+                    ${otpData.total_access_count > 0 ? `
+                        <div class="p-3 bg-[#2A2A3E] rounded-lg">
+                            <div class="text-sm text-gray-400">${window.I18N.fileFolder.securityStats}</div>
+                            <div class="text-white">${window.I18N.fileFolder.totalAccesses}: ${otpData.total_access_count}</div>
+           
+                    ${otpData.last_successful_access_at ?
+                        `<div class="text-gray-400 text-xs">${window.I18N.fileFolder.lastAccess}: ${new Date(otpData.last_successful_access_at).toLocaleString()}</div>` : ''}
+                        </div>
+                    ` : ''}
+                </div>
+            ` : `
+                <div class="text-center py-4 text-gray-400">
+                    <div class="text-4xl mb-2">🔓</div>
+                    <div>${window.I18N.fileFolder.otpDisabledTitle}</div>
+                    <div class="text-sm">${window.I18N.fileFolder.otpDisabledDesc}</div>
+                </div>
+            `}
+
+            <div class="flex gap-3 pt-4">
+                <button id="saveOtpSettings" class="flex-1 bg-[#f89c00] text-white px-4 py-2 rounded-lg hover:bg-[#e88900] transition-colors">
+                    ${isEnabled ? window.I18N.fileFolder.updateSettings : window.I18N.fileFolder.enableOtp}
+                </button>
+                <button id="cancelOtpModal" class="px-4 py-2 bg-[#3C3F58] text-white rounded-lg hover:bg-[#4A4D6A] transition-colors">
+                    ${window.I18N.fileFolder.cancel}
+                </button>
+            </div>
+        </div>
+    `;
+
+    // Add event listeners
+    document.getElementById('saveOtpSettings').addEventListener('click', () => saveOtpSettings(fileId));
+    document.getElementById('closeOtpModal').addEventListener('click', () => {
+        const modal = document.getElementById('otpSecurityModal');
+        if (modal) modal.remove();
+    });
+    document.getElementById('cancelOtpModal').addEventListener('click', () => {
+        const modal = document.getElementById('otpSecurityModal');
+        if (modal) modal.remove();
+    });
+    
+    // Add delete shared link event listener if OTP is enabled
+    if (isEnabled) {
+        const deleteSharedLinkBtn = document.getElementById('deleteSharedLink');
+        if (deleteSharedLinkBtn) {
+            deleteSharedLinkBtn.addEventListener('click', () => deleteSharedLink(fileId));
+        }
+    }
+    
+    // Add disable OTP event listeners if OTP is enabled
+    if (isEnabled) {
+        document.getElementById('sendDisableOtp').addEventListener('click', () => sendDisableOtp(fileId));
+        document.getElementById('confirmDisableOtp').addEventListener('click', () => confirmDisableOtp(fileId));
+        document.getElementById('disableOtpCode').addEventListener('input', (e) => {
+            const confirmBtn = document.getElementById('confirmDisableOtp');
+            confirmBtn.disabled = e.target.value.length !== 6;
+        });
+    }
+}
+
+async function saveOtpSettings(fileId) {
+    const toggle = document.getElementById('otpToggle');
+    const requireDownload = document.getElementById('requireDownload');
+    const requirePreview = document.getElementById('requirePreview');
+    const otpDuration = document.getElementById('otpDuration');
+    
+    const isEnabled = toggle.checked;
+    
+    try {
+        const url = isEnabled ? '/file-otp/enable' : '/file-otp/disable';
+        const body = {
+            file_type: 'regular',
+            file_id: parseInt(fileId)
+        };
+
+        if (isEnabled) {
+            body.require_otp_for_download = requireDownload?.checked ?? true;
+            body.require_otp_for_preview = requirePreview?.checked ?? false;
+            body.otp_valid_duration_minutes = parseInt(otpDuration?.value ?? 10);
+        }
+
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: {
+                'Accept': 'application/json',
+                'Content-Type': 'application/json',
+                'X-Requested-With': 'XMLHttpRequest',
+                'X-CSRF-TOKEN': getCsrfToken()
+            },
+            credentials: 'same-origin',
+            body: JSON.stringify(body)
+        });
+
+        const result = await response.json();
+        
+        if (result.success) {
+            // Show success notification
+            showNotification(isEnabled ? window.I18N.fileFolder.msgOtpEnabledSuccess : window.I18N.fileFolder.msgOtpDisabledSuccess, 'success');
+            
+            // Close modal
+            const modal = document.getElementById('otpSecurityModal');
+            if (modal) {
+                modal.remove();
+            }
+            
+            // Refresh file list to show OTP indicator
+            if (window.loadUserFiles) {
+                window.loadUserFiles(state.lastMainSearch, state.currentPage, state.currentParentId);
+            }
+        } else {
+            throw new Error(result.message || window.I18N.fileFolder.msgOtpUpdateFailed || 'Failed to update OTP settings');
+        }
+    } catch (error) {
+        console.error('Failed to save OTP settings:', error);
+        showNotification((window.I18N.fileFolder.msgOtpUpdateFailed || 'Failed to update OTP settings') + ': ' + error.message, 'error');
+    }
+}
+
+
+async function deleteSharedLink(fileId) {
+    try {
+        const confirmed = window.confirm('Are you sure you want to delete the shared link for this file? This action cannot be undone.');
+        if (!confirmed) return;
+
+        const response = await fetch('/file-otp/delete-shared-link', {
+            method: 'POST',
+            headers: {
+                'Accept': 'application/json',
+                'Content-Type': 'application/json',
+                'X-Requested-With': 'XMLHttpRequest',
+                'X-CSRF-TOKEN': getCsrfToken()
+            },
+            credentials: 'same-origin',
+            body: JSON.stringify({
+                file_type: 'regular',
+                file_id: parseInt(fileId)
+            })
+        });
+
+        const result = await response.json();
+
+        if (result.success) {
+            showNotification('Shared link deleted successfully', 'success');
+        } else {
+            showNotification(result.message || window.I18N.fileFolder.msgSharedLinkDeleteFailed, 'error');
+        }
+    } catch (error) {
+        console.error('Error deleting shared link:', error);
+        showNotification(window.I18N.fileFolder.msgSharedLinkDeleteFailed + ': ' + error.message, 'error');
+    }
+}
+
+async function sendDisableOtp(fileId) {
+    try {
+        const response = await fetch('/file-otp/send', {
+            method: 'POST',
+            headers: {
+                'Accept': 'application/json',
+                'Content-Type': 'application/json',
+                'X-Requested-With': 'XMLHttpRequest',
+                'X-CSRF-TOKEN': getCsrfToken()
+            },
+            credentials: 'same-origin',
+            body: JSON.stringify({
+                file_type: 'regular',
+                file_id: parseInt(fileId)
+            })
+        });
+
+        const result = await response.json();
+        
+        if (result.success) {
+            showNotification(window.I18N.fileFolder.msgOtpSent, 'success');
+            document.getElementById('disableOtpCode').disabled = false;
+            document.getElementById('sendDisableOtp').disabled = true;
+            document.getElementById('sendDisableOtp').textContent = window.I18N.fileFolder.msgOtpSent;
+        } else {
+            throw new Error(result.message || 'Failed to send OTP');
+        }
+    } catch (error) {
+        console.error('Failed to send disable OTP:', error);
+        showNotification('Failed to send OTP: ' + error.message, 'error');
+    }
+}
+
+async function confirmDisableOtp(fileId) {
+    const otpCode = document.getElementById('disableOtpCode').value;
+    
+    if (otpCode.length !== 6) {
+        showNotification('Please enter a valid 6-digit OTP code', 'error');
+        return;
+    }
+    
+    try {
+        const response = await fetch('/file-otp/disable', {
+            method: 'POST',
+            headers: {
+                'Accept': 'application/json',
+                'Content-Type': 'application/json',
+                'X-Requested-With': 'XMLHttpRequest',
+                'X-CSRF-TOKEN': getCsrfToken()
+            },
+            credentials: 'same-origin',
+            body: JSON.stringify({
+                file_type: 'regular',
+                file_id: parseInt(fileId),
+                otp_code: otpCode
+            })
+        });
+
+        const result = await response.json();
+        
+        if (result.success) {
+            showNotification('OTP protection disabled successfully', 'success');
+            
+            // Close modal
+            const modal = document.getElementById('otpSecurityModal');
+            if (modal) {
+                modal.remove();
+            }
+            
+            // Refresh file list to remove OTP indicator
+            if (window.loadUserFiles) {
+                window.loadUserFiles(state.lastMainSearch, state.currentPage, state.currentParentId);
+            }
+        } else {
+            throw new Error(result.message || window.I18N.fileFolder.msgOtpDisableFailed);
+        }
+    } catch (error) {
+        console.error('Failed to disable OTP protection:', error);
+        showNotification((window.I18N.fileFolder.msgOtpDisableFailed || 'Failed to disable OTP protection') + ': ' + error.message, 'error');
+    }
+}
+
+async function handleFilePreview(fileId) {
+    try {
+        // First check if the file requires OTP for preview
+        const response = await fetch(`/files/${fileId}`, {
+            method: 'GET',
+            headers: {
+                'Accept': 'application/json',
+                'X-Requested-With': 'XMLHttpRequest',
+                'X-CSRF-TOKEN': getCsrfToken()
+            },
+            credentials: 'same-origin'
+        });
+
+        const result = await response.json();
+        
+        if (response.status === 403 && result.requires_otp) {
+            // File requires OTP verification - show OTP prompt
+            showOtpVerificationModal(fileId, result.file_name, 'preview');
+        } else if (result.success !== false) {
+            // No OTP required or already verified - redirect to file preview page
+            window.location.href = `/files/${fileId}/preview`;
+        } else {
+            throw new Error(result.message || window.I18N.fileFolder.msgFileAccessFailed);
+        }
+    } catch (error) {
+        console.error('Failed to check file access:', error);
+        showNotification(window.I18N.fileFolder.msgFileAccessFailed + ': ' + error.message, 'error');
+    }
+}
+
+function showOtpVerificationModal(fileId, fileName, accessType) {
+    // Remove any existing OTP verification modal
+    const existingModal = document.getElementById('otpVerificationModal');
+    if (existingModal) {
+        existingModal.remove();
+    }
+
+    const modal = document.createElement('div');
+    modal.id = 'otpVerificationModal';
+    modal.className = 'fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50';
+    
+    modal.innerHTML = `
+        <div class="bg-[#2A2A3E] rounded-lg p-6 w-full max-w-md mx-4 border border-[#3C3F58]">
+            <div class="text-center mb-6">
+                <div class="text-4xl mb-4">🔐</div>
+                <h3 class="text-xl font-semibold text-white mb-2">${window.I18N.fileFolder.otpVerifyTitle}</h3>
+                <p class="text-gray-300 text-sm">${window.I18N.fileFolder.otpVerifyDesc.replace(':access', accessType === 'preview' ? (window.I18N.fileFolder.preview || 'preview') : (window.I18N.fileFolder.access || 'access')).replace(':name', fileName)}</p>
+            </div>
+
+            <div class="space-y-4">
+                <div>
+                    <label class="block text-sm text-gray-300 mb-2">${window.I18N.fileFolder.otpCode}</label>
+                    <input type="text" id="otpVerificationCode" placeholder="${window.I18N.fileFolder.phEnterOtp}" maxlength="6" 
+                    class="w-full px-3 py-2 bg-[#1A1A2E] border border-[#3C3F58] rounded-md text-white text-center text-lg tracking-widest focus:border-[#f89c00] focus:ring-1 focus:ring-[#f89c00]">
+                </div>
+                
+                <div class="text-center">   
+                    <button id="sendOtpForAccess" class="text-[#f89c00] hover:text-[#e88900] text-sm underline">
+                        ${window.I18N.fileFolder.sendOtp}
+                    </button>
+                </div>
+            </div>
+
+            <div class="flex gap-3 mt-6">
+                <button id="verifyOtpAccess" class="flex-1 bg-[#f89c00] text-white px-4 py-2 rounded-lg hover:bg-[#e88900] transition-colors" disabled>
+                    ${window.I18N.fileFolder.verifyAnd} ${accessType === 'preview' ?
+                    (window.I18N.fileFolder.preview || 'Preview') : (window.I18N.fileFolder.access || 'Access')}
+                </button>
+                <button id="cancelOtpVerification" class="px-4 py-2 bg-[#3C3F58] text-white rounded-lg hover:bg-[#4A4D6A] transition-colors">
+                    ${window.I18N.fileFolder.cancel}
+                </button>
+            </div>
+        </div>
+    `;
+
+    document.body.appendChild(modal);
+
+    // Add event listeners
+    const otpInput = document.getElementById('otpVerificationCode');
+    const verifyBtn = document.getElementById('verifyOtpAccess');
+    const sendBtn = document.getElementById('sendOtpForAccess');
+    const cancelBtn = document.getElementById('cancelOtpVerification');
+
+    otpInput.addEventListener('input', (e) => {
+        verifyBtn.disabled = e.target.value.length !== 6;
+    });
+
+    sendBtn.addEventListener('click', () => sendOtpForAccess(fileId, sendBtn));
+    verifyBtn.addEventListener('click', () => verifyOtpForAccess(fileId, accessType, modal));
+    cancelBtn.addEventListener('click', () => modal.remove());
+
+    // Auto-send OTP when modal opens
+    sendOtpForAccess(fileId, sendBtn);
+}
+
+async function sendOtpForAccess(fileId, sendBtn) {
+    try {
+        sendBtn.disabled = true;
+        sendBtn.textContent = window.I18N.fileFolder.sending;
+
+        const response = await fetch('/file-otp/send', {
+            method: 'POST',
+            headers: {
+                'Accept': 'application/json',
+                'Content-Type': 'application/json',
+                'X-Requested-With': 'XMLHttpRequest',
+                'X-CSRF-TOKEN': getCsrfToken()
+            },
+            credentials: 'same-origin',
+            body: JSON.stringify({
+                file_type: 'regular',
+                file_id: parseInt(fileId)
+            })
+        });
+
+        const result = await response.json();
+        
+        if (result.success) {
+            showNotification(window.I18N.fileFolder.msgOtpSent, 'success');
+            sendBtn.textContent = window.I18N.fileFolder.otpSentCheck;
+            sendBtn.className = 'text-green-400 text-sm';
+        } else {
+            throw new Error(result.message || 'Failed to send OTP');
+        }
+    } catch (error) {
+        console.error('Failed to send OTP:', error);
+        showNotification('Failed to send OTP: ' + error.message, 'error');
+        sendBtn.disabled = false;
+        sendBtn.textContent = 'Send OTP to Email';
+    }
+}
+
+async function verifyOtpForAccess(fileId, accessType, modal) {
+    const otpCode = document.getElementById('otpVerificationCode').value;
+    
+    if (otpCode.length !== 6) {
+        showNotification('Please enter a valid 6-digit OTP code', 'error');
+        return;
+    }
+    
+    try {
+        const response = await fetch('/file-otp/verify', {
+            method: 'POST',
+            headers: {
+                'Accept': 'application/json',
+                'Content-Type': 'application/json',
+                'X-Requested-With': 'XMLHttpRequest',
+                'X-CSRF-TOKEN': getCsrfToken()
+            },
+            credentials: 'same-origin',
+            body: JSON.stringify({
+                file_type: 'regular',
+                file_id: parseInt(fileId),
+                otp_code: otpCode
+            })
+        });
+
+        const result = await response.json();
+        
+        if (result.success) {
+            showNotification('OTP verified successfully', 'success');
+            modal.remove();
+            
+            // Now proceed to the file preview/access
+            if (accessType === 'preview') {
+                window.location.href = `/files/${fileId}/preview`;
+            } else {
+                // Handle other access types if needed
+                window.location.href = `/files/${fileId}/preview`;
+            }
+        } else {
+            throw new Error(result.message || window.I18N.fileFolder.msgOtpInvalid);
+        }
+    } catch (error) {
+        console.error('Failed to verify OTP:', error);
+        showNotification(window.I18N.fileFolder.msgOtpVerifyFailed + ': ' + error.message, 'error');
+    }
+}
+
+/**
+ * Load file for Arweave upload with preflight validation and cost calculation
+ */
+async function loadFileForArweaveUpload(fileId) {
+    try {
+        console.log('🚀 Starting Arweave upload process for file:', fileId);
+        
+        // Show loading notification
+        showNotification(window.I18N.fileFolder.msgArwValidating, 'info');
+        
+        // Step 1: Run preflight validation
+        console.log('📋 Running preflight validation...');
+        console.log('📍 Request URL: /arweave-upload/preflight-validation');
+        console.log('📍 File ID:', fileId);
+        console.log('📍 CSRF Token:', getCsrfToken() ? '✅ Present' : '❌ Missing');
+        
+        const validationResponse = await fetch('/arweave-upload/preflight-validation', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-CSRF-TOKEN': getCsrfToken(),
+                'X-Requested-With': 'XMLHttpRequest'
+            },
+            credentials: 'same-origin',
+            body: JSON.stringify({ file_id: fileId })
+        });
+
+        console.log('📊 Response Status:', validationResponse.status, validationResponse.statusText);
+        console.log('📊 Response Headers:', {
+            'content-type': validationResponse.headers.get('content-type'),
+            'x-request-id': validationResponse.headers.get('x-request-id')
+        });
+
+        if (!validationResponse.ok) {
+            let errorData = {};
+            try {
+                errorData = await validationResponse.json();
+            } catch (e) {
+                console.error('❌ Failed to parse error response:', e);
+                errorData = { message: `HTTP ${validationResponse.status}: ${validationResponse.statusText}` };
+            }
+            
+            console.error('❌ Validation response not OK:', {
+                status: validationResponse.status,
+                statusText: validationResponse.statusText,
+                errorData: errorData
+            });
+            
+            throw new Error(errorData.message || `Validation failed (HTTP ${validationResponse.status})`);
+        }
+
+        const validationData = await validationResponse.json();
+
+        if (!validationData.success) {
+            const errors = validationData.validation?.errors || ['Validation failed'];
+            console.error('❌ Validation returned success: false', errors);
+            throw new Error(errors[0] || 'File validation failed');
+        }
+
+        console.log('✅ Preflight validation passed:', validationData);
+
+        // Step 2: Check balance and show cost estimate
+        const uploadCost = validationData.upload_cost;
+        console.log('💰 Upload cost:', uploadCost);
+
+        // Check if Bundlr is initialized
+        if (!window.isWalletReady || !window.isWalletReady()) {
+            showNotification('⚠️ Please initialize Bundlr wallet first using the "B" button in navigation', 'warning');
+            return;
+        }
+
+        // Get current balance
+        const currentBalance = window.getCurrentBalance();
+        console.log('💳 Current Bundlr balance:', currentBalance, 'MATIC');
+
+        // Check if balance is sufficient
+        if (currentBalance < uploadCost.matic) {
+            const shortfall = (uploadCost.matic - currentBalance).toFixed(6);
+            showNotification(
+                `❌ Insufficient balance. Need ${uploadCost.matic.toFixed(6)} MATIC but have ${currentBalance.toFixed(6)} MATIC. Short by ${shortfall} MATIC.`,
+                'error'
+            );
+            return;
+        }
+
+        console.log('✅ Sufficient balance for upload');
+
+        // Step 3: Open modal with pre-populated data
+        console.log('🎯 Opening Arweave modal...');
+        
+        if (typeof window.openClientArweaveModal === 'function') {
+            // Store the file ID and validation data for the modal
+            window.arweaveUploadContext = {
+                fileId: fileId,
+                fileName: validationData.validation.file_info.name,
+                fileSize: validationData.validation.file_info.size,
+                fileSizeHuman: validationData.validation.file_info.size_human,
+                uploadCost: uploadCost,
+                validationData: validationData
+            };
+
+            console.log('📦 Stored upload context:', window.arweaveUploadContext);
+
+            // Open the modal
+            window.openClientArweaveModal();
+            
+            // Update modal with file info
+            setTimeout(() => {
+                updateArweaveModalWithFileInfo(window.arweaveUploadContext);
+            }, 300);
+        } else {
+            throw new Error('Arweave modal is not available');
+        }
+        
+        showNotification(`✅ ${window.I18N.fileFolder.msgArwReady} (${uploadCost.formatted})`, 'success');
+        
+    } catch (error) {
+        console.error('❌ Failed to pre-populate Arweave modal:', error);
+        showNotification(window.I18N.fileFolder.msgArwAutoSelectFailed, 'warning');
+    }
+}
+
+/**
+ * Update Arweave modal with file information
+ */
+function updateArweaveModalWithFileInfo(context) {
+    try {
+        console.log('🔄 Updating modal with file info:', context);
+        
+        // Update file name display
+        const fileNameEl = document.getElementById('selectedFileInfo');
+        if (fileNameEl) {
+            fileNameEl.textContent = `${context.fileName} (${context.fileSizeHuman})`;
+        }
+
+        // Update upload cost display
+        const costEl = document.getElementById('uploadCostDisplay');
+        if (costEl) {
+            costEl.textContent = context.uploadCost.formatted;
+        }
+
+        // Update file name in upload step
+        const uploadFileNameEl = document.getElementById('uploadFileName');
+        if (uploadFileNameEl) {
+            uploadFileNameEl.textContent = context.fileName;
+        }
+
+        // Update upload cost in final step
+        const uploadCostFinalEl = document.getElementById('uploadCostFinal');
+        if (uploadCostFinalEl) {
+            uploadCostFinalEl.textContent = context.uploadCost.formatted;
+        }
+
+        console.log('✅ Modal updated with file info');
+        
+    } catch (error) {
+        console.error('❌ Failed to update modal:', error);
+    }
+}
+
+/**
+ * Pre-populate the Arweave modal with a file
+ */
+function prePopulateArweaveModal(file) {
+    try {
+        console.log('🔄 Pre-populating Arweave modal with file:', file.name);
+        
+        // Set the file in the modal's file input
+        const fileInput = document.getElementById('clientArweaveFile');
+        if (fileInput) {
+            // Create a DataTransfer object to simulate file selection
+            const dataTransfer = new DataTransfer();
+            dataTransfer.items.add(file);
+            fileInput.files = dataTransfer.files;
+            
+            // Trigger change event to update modal
+            const changeEvent = new Event('change', { bubbles: true });
+            fileInput.dispatchEvent(changeEvent);
+            
+            console.log('✅ File pre-populated in Arweave modal');
+        } else {
+            console.error('❌ Arweave file input not found');
+        }
+        
+    } catch (error) {
+        console.error('❌ Failed to pre-populate Arweave modal:', error);
+        showNotification('File loaded but failed to auto-select. Please choose the file manually.', 'warning');
+    }
+}
+
+// Rename Modal Functions
+function showRenameModal(fileId) {
+    // Get current file info to populate the modal
+    const fileElement = document.querySelector(`[data-item-id="${fileId}"]`);
+    if (!fileElement) {
+        showNotification('File not found', 'error');
+        return;
+    }
+    
+    const fileName = fileElement.getAttribute('data-item-name') || 'Unknown';
+    const isFolder = fileElement.getAttribute('data-is-folder') === 'true';
+    
+    // Remove any existing modal
+    const existingModal = document.getElementById('renameModal');
+    if (existingModal) {
+        existingModal.remove();
+    }
+
+    // Create modal HTML
+    const modal = document.createElement('div');
+    modal.id = 'renameModal';
+    modal.className = 'fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50';
+    modal.innerHTML = `
+        <div class="bg-[#1F2235] rounded-lg p-6 w-full max-w-md mx-4 border border-[#3C3F58]">
+            <div class="flex items-center justify-between mb-4">
+                <h3 class="text-lg font-semibold text-white">${window.I18N.fileFolder.rename} ${isFolder ?
+                (window.I18N.fileFolder.folder || 'Folder') : (window.I18N.fileFolder.file || 'File')}</h3>
+                <button id="closeRenameModal" class="text-gray-400 hover:text-white">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
+                    </svg>
+                </button>
+            </div>
+            
+            <div class="space-y-4">
+                <div>
+                    <label class="block text-sm text-gray-300 mb-2">${window.I18N.fileFolder.currentName}</label>
+                    <div class="px-3 py-2 bg-[#2A2D47] text-gray-400 rounded-lg text-sm">${fileName}</div>
+                </div>
+                
+                <div>
+                    <label for="newFileName" class="block text-sm text-gray-300 mb-2">${window.I18N.fileFolder.newName}</label>
+                    <input 
+                        type="text" 
+                        id="newFileName" 
+                        class="w-full px-3 py-2 bg-[#2A2D47] text-white rounded-lg border border-[#3C3F58] focus:border-[#f89c00] focus:ring-1 focus:ring-[#f89c00] focus:outline-none"
+                        value="${fileName}"
+                        placeholder="${window.I18N.fileFolder.enterNewName}"
+                        maxlength="255"
+                    />
+                    <div class="text-xs text-gray-500 mt-1">
+                        ${window.I18N.fileFolder.nameValidation}
+                    </div>
+                </div>
+            </div>
+            
+            <div class="flex justify-end gap-3 mt-6">
+                <button id="cancelRename" class="px-4 py-2 bg-[#3C3F58] text-white rounded-lg hover:bg-[#4A4D6A] transition-colors">
+                    ${window.I18N.fileFolder.cancel}
+                </button>
+                <button id="confirmRename" class="px-4 py-2 bg-[#f89c00] text-white rounded-lg hover:bg-[#e6890d] transition-colors">
+                    ${window.I18N.fileFolder.rename}
+                </button>
+            </div>
+        </div>
+    `;
+
+    document.body.appendChild(modal);
+
+    // Get modal elements
+    const newFileNameInput = modal.querySelector('#newFileName');
+    const confirmBtn = modal.querySelector('#confirmRename');
+    const cancelBtn = modal.querySelector('#cancelRename');
+    const closeBtn = modal.querySelector('#closeRenameModal');
+
+    // Focus and select the input text (without extension for files)
+    newFileNameInput.focus();
+    if (!isFolder && fileName.includes('.')) {
+        const lastDotIndex = fileName.lastIndexOf('.');
+        newFileNameInput.setSelectionRange(0, lastDotIndex);
+    } else {
+        newFileNameInput.select();
+    }
+
+    // Close modal function
+    const closeModal = () => {
+        modal.remove();
+    };
+
+    // Event listeners
+    closeBtn.addEventListener('click', closeModal);
+    cancelBtn.addEventListener('click', closeModal);
+    modal.addEventListener('click', (e) => {
+        if (e.target === modal) closeModal();
+    });
+
+    // Handle Enter key
+    newFileNameInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            confirmBtn.click();
+        }
+        if (e.key === 'Escape') {
+            closeModal();
+        }
+    });
+
+    // Rename confirmation
+    confirmBtn.addEventListener('click', async () => {
+        console.log('[RENAME] Confirm button clicked');
+        const newName = newFileNameInput.value.trim();
+        console.log('[RENAME] New name:', newName);
+        
+        if (!newName) {
+            showNotification(window.I18N.fileFolder.msgEnterValidName || 'Please enter a valid name', 'error');
+            return;
+        }
+
+        if (newName === fileName) {
+            showNotification(window.I18N.fileFolder.msgNameSame || 'Name is unchanged', 'warning');
+            return;
+        }
+
+        // Disable button during rename
+        confirmBtn.disabled = true;
+        confirmBtn.textContent = window.I18N.fileFolder.btnRenaming;
+
+        try {
+            await window.renameItem(fileId, newName);
+            closeModal();
+        } catch (error) {
+            showNotification(error.message, 'error');
+        } finally {
+            confirmBtn.disabled = false;
+            confirmBtn.textContent = window.I18N.fileFolder.rename;
+        }
+    });
+}
+
+async function renameItem(fileId, newName) {
+    console.log('[RENAME] renameItem called with:', { fileId, newName });
+    try {
+        const response = await fetch(`/files/${fileId}/rename`, {
+            method: 'PATCH',
+            headers: {
+                'Accept': 'application/json',
+                'Content-Type': 'application/json',
+                'X-Requested-With': 'XMLHttpRequest',
+                'X-CSRF-TOKEN': getCsrfToken()
+            },
+            credentials: 'same-origin',
+            body: JSON.stringify({
+                new_name: newName
+            })
+        });
+
+        if (!response.ok) {
+            const errorData = await response.json();
+            throw new Error(errorData.message || window.I18N.fileFolder.renameFailed);
+        }
+
+        const result = await response.json();
+        
+        if (result.success) {
+            showNotification(result.message || window.I18N.fileFolder.renameSuccess, 'success');
+            
+            // Refresh the file list to show the updated name
+            if (window.loadUserFiles) {
+                window.loadUserFiles(state.lastMainSearch, state.currentPage, state.currentParentId);
+            }
+        } else {
+            throw new Error(result.message || window.I18N.fileFolder.renameFailed);
+        }
+
+    } catch (error) {
+        console.error('Rename failed:', error);
+        throw error;
+    }
+}
+
+/**
+ * Show share modal for creating or editing public share links
+ */
+async function showShareModal(fileId) {
+    const item = findItemById(fileId);
+    if (!item) {
+        showNotification('File not found', 'error');
+        return;
+    }
+    
+    // Fetch existing share for this file
+    let existingShare = null;
+    try {
+        const response = await fetch(`/share/file/${fileId}`, {
+            method: 'GET',
+            headers: {
+                'Accept': 'application/json',
+                'X-Requested-With': 'XMLHttpRequest',
+                'X-CSRF-TOKEN': getCsrfToken()
+            },
+            credentials: 'same-origin'
+        });
+        
+        const result = await response.json();
+        if (result.success && result.has_share) {
+            existingShare = result.share;
+        }
+    } catch (error) {
+        console.error('Failed to fetch existing share:', error);
+        // Continue with modal creation even if fetch fails
+    }
+
+    const modal = document.createElement('div');
+    modal.className = 'fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4';
+    modal.innerHTML = `
+        <div class="bg-[#1F2235] rounded-lg shadow-xl max-w-md w-full p-6 border border-[#4A4D6A]">
+            <div class="flex items-center justify-between mb-4">
+                <h3 class="text-lg font-semibold text-white">${existingShare ?
+                window.I18N.fileFolder.lblEditShareLink : window.I18N.fileFolder.lblCreateShareLink}</h3>
+                <button type="button" class="text-gray-400 hover:text-gray-300" onclick="this.closest('.fixed').remove()">
+                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
+                    </svg>
+                </button>
+            </div>
+            ${existingShare ? `
+            <div class="mb-4 p-3 bg-yellow-900/20 border border-yellow-500/30 rounded-lg text-sm text-yellow-300">
+                <div class="flex items-start">
+                    <svg class="w-4 h-4 mt-0.5 mr-2 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                    </svg>
+                    <span>${(window.I18N.fileFolder.shareWarning || 'You already have an active share link for this :type. Updating will modify the existing link.').replace(':type', item.is_folder ? (window.I18N.fileFolder.folder || 'folder') : (window.I18N.fileFolder.file || 'file'))}</span>
+                </div>
+            </div>` : ''}
+
+            <div class="mb-4">
+                <div class="flex items-center space-x-3 p-3 bg-[#2A2D47] rounded-lg border border-[#4A4D6A]">
+                    <div class="w-10 h-10 bg-[#f89c00] rounded-lg flex items-center justify-center">
+                        ${item.is_folder ? '📁' : '📄'}
+                    </div>
+                    <div class="flex-1 min-w-0">
+                        <p class="font-medium text-white truncate">${escapeHtml(item.file_name)}</p>
+                        <p class="text-sm text-gray-400">${item.is_folder ?
+                        (window.I18N.fileFolder.folder || 'Folder') : (window.I18N.fileFolder.file || 'File')}</p>
+                    </div>
+                </div>
+            </div>
+
+            <div id="shareOptions" class="space-y-4">
+                <div>
+                    <label class="flex items-center space-x-2">
+                        <input type="checkbox" id="isOneTime" class="rounded border-[#4A4D6A] text-[#f89c00] focus:ring-[#f89c00] bg-[#2A2D47]" ${existingShare?.is_one_time ?
+'checked' : ''}>
+                        <span class="text-sm text-gray-300">${window.I18N.fileFolder.oneTimeDownload}</span>
+                    </label>
+                </div>
+
+                <div>
+                  <label class="block text-sm font-medium text-gray-300 mb-1">${window.I18N.fileFolder.expiresInDays}</label>
+                    <select id="expiresIn" class="w-full border border-[#4A4D6A] bg-[#2A2D47] text-white rounded-md px-3 py-2 text-sm focus:ring-[#f89c00] focus:border-[#f89c00]">
+                        <option value="" ${!existingShare?.expires_at ? 'selected' : ''}>${window.I18N.fileFolder.neverExpires}</option>
+                        <option value="1" ${existingShare?.expires_at && getDaysUntilExpiry(existingShare.expires_at) === 1 ? 'selected' : ''}>${window.I18N.fileFolder.lbl1Day}</option>
+                        <option value="7" ${existingShare?.expires_at && getDaysUntilExpiry(existingShare.expires_at) === 7 ? 'selected' : ''}>${window.I18N.fileFolder.lbl1Week}</option>
+                        <option value="30" ${existingShare?.expires_at && getDaysUntilExpiry(existingShare.expires_at) === 30 ? 'selected' : ''}>${window.I18N.fileFolder.lbl1Month}</option>
+                        <option value="90" ${existingShare?.expires_at && getDaysUntilExpiry(existingShare.expires_at) === 90 ? 'selected' : ''}>${window.I18N.fileFolder.lbl3Months}</option>
+                    </select>
+                </div>
+
+                <div id="passwordSection">
+                    <label class="flex items-center space-x-2 mb-2">
+                        <input type="checkbox" id="passwordProtected" class="rounded border-[#4A4D6A] text-[#f89c00] focus:ring-[#f89c00] bg-[#2A2D47]" ${existingShare?.password_protected ? 'checked' : ''}>
+                        <span class="text-sm text-gray-300">${window.I18N.fileFolder.passwordProtection}</span>
+                        <span class="text-xs bg-[#f89c00] text-black px-2 py-1 rounded-full font-medium">${window.I18N.fileFolder.premium}</span>
+                    </label>
+                    
+                    <input type="password" id="sharePassword" placeholder="${existingShare?.password_protected ? window.I18N.fileFolder.phEnterNewPass : window.I18N.fileFolder.enterPassword}" 
+                    class="w-full border border-[#4A4D6A] bg-[#2A2D47] text-white rounded-md px-3 py-2 text-sm focus:ring-[#f89c00] focus:border-[#f89c00] placeholder-gray-500 ${existingShare?.password_protected ? '' : 'hidden'}">
+                </div>
+
+                <div id="errorMessage" class="hidden p-3 bg-red-900/20 border border-red-500/30 rounded-lg">
+                    <div class="flex items-center space-x-2">
+                        <svg class="w-4 h-4 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                        </svg>
+                        <span class="text-sm text-red-300" id="errorText"></span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="flex space-x-3 mt-6">
+                <button type="button" onclick="this.closest('.fixed').remove()" 
+                        class="flex-1 px-4 py-2 text-sm font-medium text-gray-300 bg-[#3C3F58] border border-[#4A4D6A] rounded-md hover:bg-[#55597C] focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-[#f89c00]">
+                    ${window.I18N.fileFolder.cancel}
+                </button>
+                <button type="button" id="createShareBtn"
+                        class="flex-1 px-4 py-2 text-sm font-medium text-black bg-[#f89c00] border border-transparent rounded-md hover:brightness-110 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-[#f89c00] font-semibold">
+                    ${existingShare ? window.I18N.fileFolder.lblUpdateShareLink : window.I18N.fileFolder.lblCreateShareLink}
+                </button>
+            </div>
+        </div>
+    `;
+
+    document.body.appendChild(modal);
+
+    // Handle password protection checkbox
+    const passwordCheckbox = modal.querySelector('#passwordProtected');
+    const passwordInput = modal.querySelector('#sharePassword');
+    
+    passwordCheckbox.addEventListener('change', function() {
+        if (this.checked) {
+            // Check if user is premium
+            if (!window.userIsPremium) {
+                // Show premium alert
+                alert(window.I18N.fileFolder.msgPassProtPremium);
+                this.checked = false;
+                return;
+            }
+            passwordInput.classList.remove('hidden');
+            passwordInput.focus();
+        } else {
+            passwordInput.classList.add('hidden');
+            passwordInput.value = '';
+        }
+    });
+
+    // Handle create share button
+    const createBtn = modal.querySelector('#createShareBtn');
+    createBtn.addEventListener('click', async function() {
+        const isOneTime = modal.querySelector('#isOneTime').checked;
+        const expiresIn = modal.querySelector('#expiresIn').value;
+        const passwordProtected = modal.querySelector('#passwordProtected').checked;
+        const password = modal.querySelector('#sharePassword').value;
+        const errorMessage = modal.querySelector('#errorMessage');
+        const errorText = modal.querySelector('#errorText');
+
+        // Validate password if protection is enabled
+        if (passwordProtected && !password.trim()) {
+            errorText.textContent = window.I18N.fileFolder.msgEnterPassword;
+            errorMessage.classList.remove('hidden');
+            return;
+        }
+
+        // Hide error message
+        errorMessage.classList.add('hidden');
+
+        // Show loading state
+        createBtn.disabled = true;
+        createBtn.textContent = existingShare ? window.I18N.fileFolder.lblUpdating : window.I18N.fileFolder.lblCreating;
+
+        try {
+            const response = await fetch('/share/create', {
+                method: 'POST',
+                headers: {
+                    'Accept': 'application/json',
+                    'Content-Type': 'application/json',
+                    'X-Requested-With': 'XMLHttpRequest',
+                    'X-CSRF-TOKEN': getCsrfToken()
+                },
+                credentials: 'same-origin',
+                body: JSON.stringify({
+                    file_id: fileId,
+                    is_one_time: isOneTime,
+                    expires_in_days: expiresIn ? parseInt(expiresIn) : null,
+                    ...(passwordProtected && password ? { password: password } : {})
+                })
+            });
+
+            const result = await response.json();
+
+            if (result.success) {
+                // Show success modal with share link; ensure flags reflect user's selections
+                showShareSuccessModal({
+                    ...result.share,
+                    is_one_time: !!isOneTime,
+                    password_protected: !!(passwordProtected && password && password.trim())
+                });
+                modal.remove();
+            } else {
+                if (result.requires_otp_disable) {
+                    errorText.textContent = window.I18N.fileFolder.msgShareOtpError;
+                } else if (result.requires_premium) {
+                    errorText.textContent = window.I18N.fileFolder.msgPassProtPremium;
+                } else {
+                    errorText.textContent = result.message || window.I18N.fileFolder.msgLinkGenFailed || 'Failed to create share link';
+                }
+                errorMessage.classList.remove('hidden');
+            }
+        } catch (error) {
+            console.error('Share creation failed:', error);
+            errorText.textContent = (window.I18N.fileFolder.msgLinkGenFailed || 'Failed to create share link') + '. ' + (window.I18N.fileFolder.errorLoading || 'Please try again.');
+            errorMessage.classList.remove('hidden');
+        } finally {
+            createBtn.disabled = false;
+            createBtn.textContent = existingShare ? window.I18N.fileFolder.lblUpdateShareLink : window.I18N.fileFolder.lblCreateShareLink;
+        }
+    });
+
+    // Close modal when clicking outside
+    modal.addEventListener('click', function(e) {
+        if (e.target === modal) {
+            modal.remove();
+        }
+    });
+}
+
+/**
+ * Show success modal with the created share link
+ */
+function showShareSuccessModal(share) {
+    const modal = document.createElement('div');
+    modal.className = 'fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4';
+    // Normalize boolean-like fields that may arrive as strings ("true"/"false") or numbers (1/0)
+    const isOneTime = !!(share && (share.is_one_time === true || share.is_one_time === 1 || share.is_one_time === '1' || share.is_one_time === 'true'));
+    const isPasswordProtected = !!(share && (share.password_protected === true || share.password_protected === 1 || share.password_protected === '1' || share.password_protected === 'true'));
+
+    modal.innerHTML = `
+        <div class="bg-[#1F2235] rounded-lg shadow-xl max-w-md w-full p-6 border border-[#4A4D6A]">
+            <div class="flex items-center justify-between mb-4">
+                <h3 class="text-lg font-semibold text-white">${window.I18N.fileFolder.shareLinkCreated}</h3>
+                <button type="button" class="text-gray-400 hover:text-gray-300" onclick="this.closest('.fixed').remove()">
+                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
+                    </svg>
+                </button>
+            </div>
+
+            <div class="mb-4">
+                <div class="flex items-center space-x-2 mb-2">
+                    <svg class="w-5 h-5 text-[#f89c00]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path>
+                    </svg>
+                    <span class="text-sm font-medium text-[#f89c00]">${window.I18N.fileFolder.shareCreatedSuccess}</span>
+                </div>
+                
+                <div class="bg-[#2A2D47] rounded-lg p-3 border border-[#4A4D6A]">
+                    <label class="block text-xs font-medium text-gray-300 mb-1">${window.I18N.fileFolder.shareUrl}</label>
+                    <div class="flex items-center space-x-2">
+                        <input type="text" id="shareUrl" value="${share.url}" readonly
+                               class="flex-1 text-sm bg-[#3C3F58] border border-[#4A4D6A] text-white rounded px-2 py-1 font-mono">
+        
+                        <button type="button" id="copyUrlBtn"
+                                class="px-3 py-1 text-xs font-medium text-black bg-[#f89c00] border border-transparent rounded hover:brightness-110 font-semibold">
+                            ${window.I18N.fileFolder.copy}
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="space-y-2 text-sm text-gray-300 mb-4">
+                <div class="flex justify-between">
+                    <span>${window.I18N.fileFolder.type}:</span>
+                    <span class="font-medium text-white">${share.type === 'folder' ? window.I18N.fileFolder.folder : window.I18N.fileFolder.file}</span>
+                </div>
+                ${isOneTime ?
+                `<div class="flex justify-between"><span>${window.I18N.fileFolder.access}:</span><span class="font-medium text-[#f89c00]">${window.I18N.fileFolder.oneTimeOnly}</span></div>` : ''}
+                ${isPasswordProtected ?
+                `<div class="flex justify-between"><span>${window.I18N.fileFolder.protection}:</span><span class="font-medium text-[#f89c00]">${window.I18N.fileFolder.passwordProtected}</span></div>` : ''}
+                ${share.expires_at ?
+                `<div class="flex justify-between"><span>${window.I18N.fileFolder.expires}:</span><span class="font-medium text-white">${new Date(share.expires_at).toLocaleDateString()}</span></div>` : ''}
+            </div>
+
+            <div class="flex space-x-3">
+                <button type="button" onclick="this.closest('.fixed').remove()" 
+                        class="flex-1 px-4 py-2 text-sm font-medium text-gray-300 bg-[#3C3F58] border border-[#4A4D6A] rounded-md hover:bg-[#55597C]">
+                    ${window.I18N.fileFolder.close}
+                </button>
+                <button type="button" id="openLinkBtn"
+                        class="flex-1 px-4 py-2 text-sm font-medium text-black bg-[#f89c00] border border-transparent rounded-md hover:brightness-110 font-semibold">
+                    ${window.I18N.fileFolder.openLink}
+                </button>
+            </div>
+        </div>
+    `;
+
+    document.body.appendChild(modal);
+
+    // Handle copy URL button
+    const copyBtn = modal.querySelector('#copyUrlBtn');
+    const urlInput = modal.querySelector('#shareUrl');
+    
+    copyBtn.addEventListener('click', async function() {
+        try {
+            await navigator.clipboard.writeText(urlInput.value);
+            copyBtn.textContent = window.I18N.fileFolder.copied;
+            copyBtn.classList.remove('text-blue-600', 'bg-blue-50', 'border-blue-200', 'hover:bg-blue-100');
+            copyBtn.classList.add('text-green-600', 'bg-green-50', 'border-green-200');
+            
+            setTimeout(() => {
+                copyBtn.textContent = window.I18N.fileFolder.copy;
+                copyBtn.classList.remove('text-green-600', 'bg-green-50', 'border-green-200');
+                copyBtn.classList.add('text-blue-600', 'bg-blue-50', 'border-blue-200', 'hover:bg-blue-100');
+            }, 2000);
+        } catch (error) {
+            // Fallback for older browsers
+            urlInput.select();
+            document.execCommand('copy');
+            copyBtn.textContent = window.I18N.fileFolder.copied;
+        }
+    });
+
+    // Handle open link button
+    const openBtn = modal.querySelector('#openLinkBtn');
+    openBtn.addEventListener('click', function() {
+        window.open(share.url, '_blank');
+    });
+
+    // Close modal when clicking outside
+    modal.addEventListener('click', function(e) {
+        if (e.target === modal) {
+            modal.remove();
+        }
+    });
+}
+
+
+/**
+ * Render shared files in the container
+ */
+function renderSharedFiles(sharedFiles) {
+    // Store data for layout switching
+    window.sharedFilesCurrentData = sharedFiles;
+    
+    // Initialize layout preference
+    if (!window.sharedFilesState) {
+        window.sharedFilesState = {
+            selectedItems: new Set(),
+            lastSelectedIndex: -1,
+            currentView: localStorage.getItem('sharedFilesLayout') || 'list'
+        };
+    }
+    
+    renderSharedFilesWithLayout(sharedFiles, window.sharedFilesState.currentView);
+}
+
+/**
+ * Render shared files with specific layout
+ */
+function renderSharedFilesWithLayout(sharedFiles, layout) {
+    const container = document.getElementById('filesContainer');
+    if (!container) return;
+
+    // Set view to shared
+    container.dataset.view = 'shared';
+    
+    // Hide trash banner if visible
+    hideTrashBanner();
+    
+    if (sharedFiles.length === 0) {
+        container.innerHTML = `
+            <div class="bg-[#1F2235] rounded-lg border border-[#4A4D6A] overflow-hidden">
+                <div class="flex flex-col items-center justify-center py-16 text-center">
+                    <div class="w-24 h-24 bg-[#2A2D47] rounded-full flex items-center justify-center mb-4">
+                        <svg class="w-12 h-12 text-[#f89c00]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8.684 13.342C8.886 12.938 9 12.482 9 12c0-.482-.114-.938-.316-1.342m0 2.684a3 3 0 110-2.684m0 2.684l6.632 3.316m-6.632-6l6.632-3.316m0 0a3 3 0 105.367-2.684 3 3 0 00-5.367 2.684zm0 9.316a3 3 0 105.367 2.684 3 3 0 00-5.367-2.684z" />
+                        </svg>
+                    </div>
+                    <h3 class="text-lg font-medium text-white mb-2">${window.I18N.fileFolder.noSharedFiles}</h3>
+                    <p class="text-gray-400 max-w-sm">${window.I18N.fileFolder.msgSharedFilesDesc}</p>
+                </div>
+            </div>
+        `;
+        return;
+    }
+
+    // Always render as list view (no grid/list toggle)
+    renderSharedFilesList(sharedFiles);
+    
+    // Attach event listeners
+    attachEventListeners(container);
+}
+
+/**
+ * Render shared files in grid layout
+ */
+function renderSharedFilesGrid(sharedFiles) {
+    const container = document.getElementById('filesContainer');
+    if (!container) return;
+
+    const cardsHtml = sharedFiles.map(sharedFile => {
+        const file = sharedFile.copied_file;
+        const originalShare = sharedFile.original_share;
+        const sharedBy = originalShare.user;
+        const fileSize = file.file_size ? formatFileSize(parseInt(file.file_size, 10)) : '';
+        const modifiedDate = new Date(sharedFile.copied_at).toLocaleDateString();
+        
+        return `
+            <div class="file-row bg-[#2A2D47] rounded-lg border border-[#4A4D6A] overflow-hidden hover:border-[#6B7280] transition-all cursor-pointer p-4" 
+                 data-item-id="${file.id}" data-file-id="${file.id}" data-is-folder="${file.is_folder}">
+                <div class="flex items-start justify-between mb-3">
+                    <div class="flex-1 min-w-0">
+                        <div class="w-12 h-12 flex items-center justify-center mb-2">
+                            ${getFileIconSvg(file.file_name, file.is_folder)}
+                        </div>
+                        <div class="text-sm font-medium text-white truncate" title="${escapeHtml(file.file_name)}">${escapeHtml(file.file_name)}</div>
+                    </div>
+                    <button class="actions-menu-btn p-1 hover:bg-[#3C3F58] rounded flex-shrink-0" 
+                            data-item-id="${file.id}" title="${window.I18N.fileFolder.moreActions}">
+                        <svg class="w-4 h-4 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 5v.01M12 12v.01M12 19v.01"></path>
+                        </svg>
+                    </button>
+                </div>
+                <div class="text-xs text-gray-400">
+                    <span class="text-gray-400">${window.I18N.fileFolder.sharedBy} ${escapeHtml(sharedBy.name)}</span>
+                </div>
+                <div class="text-xs text-gray-400">
+                    ${fileSize ? `<span>${fileSize}</span>` : ''} • ${modifiedDate}
+                </div>
+            </div>
+        `;
+    }).join('');
+
+    container.innerHTML = `
+        <div class="space-y-4">
+            <!-- Header -->
+            <div class="bg-[#2A2D47] border border-[#4A4D6A] rounded-lg px-4 py-3">
+                <div class="flex items-center space-x-3">
+                    <div class="w-8 h-8 bg-[#f89c00] rounded flex items-center justify-center">
+                        <svg class="w-5 h-5 text-black" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8.684 13.342C8.886 12.938 9 12.482 9 12c0-.482-.114-.938-.316-1.342m0 2.684a3 3 0 110-2.684m0 2.684l6.632 3.316m-6.632-6l6.632-3.316m0 0a3 3 0 105.367-2.684 3 3 0 00-5.367 2.684zm0 9.316a3 3 0 105.367 2.684 3 3 0 00-5.367-2.684z" />
+                        </svg>
+                    </div>
+                    <div>
+                        <h2 class="text-lg font-semibold text-white">${window.I18N.fileFolder.sharedWithMe}</h2>
+                        <p class="text-sm text-gray-400">${sharedFiles.length} ${window.I18N.fileFolder.lblFiles}</p>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Grid -->
+            <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-4">
+                ${cardsHtml}
+            </div>
+        </div>
+    `;
+}
+
+/**
+ * Render shared files in list layout
+ */
+function renderSharedFilesList(sharedFiles) {
+    const container = document.getElementById('filesContainer');
+    if (!container) return;
+
+    const filesHtml = sharedFiles.map(sharedFile => {
+        const file = sharedFile.copied_file;
+        const originalShare = sharedFile.original_share;
+        const sharedBy = originalShare.user;
+        const fileSize = file.file_size ? formatFileSize(parseInt(file.file_size, 10)) : '';
+        const modifiedDate = new Date(sharedFile.copied_at).toLocaleDateString();
+        
+        return `
+            <tr class="file-row hover:bg-[#2A2D47] border-b border-[#4A4D6A] cursor-pointer" 
+                data-item-id="${file.id}" data-file-id="${file.id}" data-is-folder="${file.is_folder}">
+                <td class="px-4 py-3">
+                    <div class="flex items-center space-x-3">
+                        <div class="w-8 h-8 flex items-center justify-center">
+                            ${getFileIconSvg(file.file_name, file.is_folder)}
+                        </div>
+                        <div class="flex-1 min-w-0">
+                            <div class="text-sm font-medium text-white truncate">${escapeHtml(file.file_name)}</div>
+                            <div class="text-xs text-gray-400">
+                                ${window.I18N.fileFolder.sharedBy} ${escapeHtml(sharedBy.name)} • ${fileSize}
+                            </div>
+                        </div>
+                    </div>
+                </td>
+                <td class="px-4 py-3 text-sm text-gray-300 text-right">
+                    <div class="flex items-center justify-end space-x-2">
+                        <span>${modifiedDate}</span>
+                        <button class="actions-menu-btn p-1 hover:bg-[#3C3F58] rounded" 
+                            data-item-id="${file.id}" aria-expanded="false" title="${window.I18N.fileFolder.moreActions}">
+                            <svg class="w-4 h-4 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 5v.01M12 12v.01M12 19v.01"></path>
+                            </svg>
+                        </button>
+                    </div>
+                </td>
+            </tr>
+        `;
+    }).join('');
+
+    container.innerHTML = `
+        <div class="bg-[#1F2235] rounded-lg border border-[#4A4D6A] overflow-hidden">
+            <!-- Header -->
+            <div class="bg-[#2A2D47] border-b border-[#4A4D6A] px-4 py-3">
+                <div class="flex items-center space-x-3">
+                    <div class="w-8 h-8 bg-[#f89c00] rounded flex items-center justify-center">
+                        <svg class="w-5 h-5 text-black" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8.684 13.342C8.886 12.938 9 12.482 9 12c0-.482-.114-.938-.316-1.342m0 2.684a3 3 0 110-2.684m0 2.684l6.632 3.316m-6.632-6l6.632-3.316m0 0a3 3 0 105.367-2.684 3 3 0 00-5.367 2.684zm0 9.316a3 3 0 105.367 2.684 3 3 0 00-5.367-2.684z" />
+                        </svg>
+                    </div>
+                    <div>
+                        <h2 class="text-lg font-semibold text-white">${window.I18N.fileFolder.sharedWithMe}</h2>
+                        <p class="text-sm text-gray-400">${sharedFiles.length} ${window.I18N.fileFolder.lblFiles}</p>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Table -->
+            <div class="overflow-x-auto">
+                <table class="w-full">
+                    <tbody class="divide-y divide-[#4A4D6A]">
+                        ${filesHtml}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    `;
+}
+
+/**
+ * Attach event listeners to shared files container
+ */
+function attachEventListeners(container) {
+    // Initialize shared files state
+    if (!window.sharedFilesState) {
+        window.sharedFilesState = {
+            selectedItems: new Set(),
+            lastSelectedIndex: -1,
+            currentView: 'list' // 'list' or 'grid'
+        };
+    }
+
+    // Checkbox listeners removed - no checkboxes in UI
+
+    // File row click handler - do nothing on click
+    const fileRows = container.querySelectorAll('.file-row');
+    fileRows.forEach((row, index) => {
+        row.addEventListener('click', function(e) {
+            // Don't handle file row clicks - only allow actions menu button
+            if (e.target.closest('.actions-menu-btn')) {
+                return;
+            }
+            e.preventDefault();
+            e.stopPropagation();
+        });
+    });
+
+    // Actions menu buttons
+    const actionButtons = container.querySelectorAll('.actions-menu-btn');
+    actionButtons.forEach(btn => {
+        btn.addEventListener('click', function(e) {
+            e.stopPropagation();
+            const fileId = this.dataset.itemId;
+            showSharedFileContextMenu(e, fileId, container);
+        });
+    });
+
+    // File checkbox listeners removed - no checkboxes in UI
+
+    // Keyboard shortcuts removed - no selection in UI
+
+    // View toggle removed - only list view available
+}
+
+/**
+ * Toggle selection of a shared file
+ */
+function toggleSharedFileSelection(fileId, container) {
+    if (window.sharedFilesState.selectedItems.has(fileId)) {
+        window.sharedFilesState.selectedItems.delete(fileId);
+    } else {
+        window.sharedFilesState.selectedItems.add(fileId);
+    }
+    updateSharedFilesSelectionUI(container);
+}
+
+/**
+ * Select range of shared files (Shift+click)
+ */
+function selectSharedFilesRange(container, startIndex, endIndex) {
+    const rows = Array.from(container.querySelectorAll('.file-row'));
+    const minIndex = Math.min(startIndex, endIndex);
+    const maxIndex = Math.max(startIndex, endIndex);
+    
+    window.sharedFilesState.selectedItems.clear();
+    
+    for (let i = minIndex; i <= maxIndex; i++) {
+        const row = rows[i];
+        if (row) {
+            window.sharedFilesState.selectedItems.add(row.dataset.fileId);
+        }
+    }
+    
+    window.sharedFilesState.lastSelectedIndex = endIndex;
+    updateSharedFilesSelectionUI(container);
+}
+
+/**
+ * Clear all shared files selection
+ */
+function clearSharedFilesSelection(container) {
+    window.sharedFilesState.selectedItems.clear();
+    window.sharedFilesState.lastSelectedIndex = -1;
+    
+    const checkboxes = container.querySelectorAll('.file-checkbox');
+    checkboxes.forEach(checkbox => {
+        checkbox.checked = false;
+    });
+    
+    const selectAllCheckbox = container.querySelector('.select-all-checkbox');
+    if (selectAllCheckbox) {
+        selectAllCheckbox.checked = false;
+        selectAllCheckbox.indeterminate = false;
+    }
+    
+    updateSharedFilesSelectionUI(container);
+}
+
+/**
+ * Update UI for shared files selection
+ */
+function updateSharedFilesSelectionUI(container) {
+    const count = window.sharedFilesState.selectedItems.size;
+    const selectAllCheckbox = container.querySelector('.select-all-checkbox');
+    const allCheckboxes = container.querySelectorAll('.file-checkbox');
+    
+    // Update select all checkbox state
+    if (selectAllCheckbox) {
+        selectAllCheckbox.checked = count === allCheckboxes.length && count > 0;
+        selectAllCheckbox.indeterminate = count > 0 && count < allCheckboxes.length;
+    }
+    
+    // Update visual states
+    container.querySelectorAll('.file-row').forEach(row => {
+        if (window.sharedFilesState.selectedItems.has(row.dataset.fileId)) {
+            row.classList.add('bg-[#3C3F58]', 'bg-opacity-50');
+        } else {
+            row.classList.remove('bg-[#3C3F58]', 'bg-opacity-50');
+        }
+    });
+}
+
+/**
+ * Show context menu for shared file
+ */
+function showSharedFileContextMenu(event, fileId, container) {
+    const fileRow = container.querySelector(`[data-file-id="${fileId}"]`);
+    const fileName = fileRow?.querySelector('.text-white.truncate')?.textContent || 'File';
+    const isFolder = fileRow?.dataset.isFolder === 'true';
+    
+    const menu = document.createElement('div');
+    menu.className = 'fixed bg-white rounded-lg shadow-lg z-50 py-1 min-w-[200px]';
+    menu.style.top = (event.clientY + 5) + 'px';
+    menu.style.left = (event.clientX - 100) + 'px';
+    
+    menu.innerHTML = `
+        <button class="copy-btn w-full text-left px-4 py-2 hover:bg-gray-100 flex items-center space-x-2 text-gray-800" data-file-id="${fileId}">
+            <span>📋</span><span>${window.I18N.fileFolder.btnCopyToFiles || 'Copy to My Files'}</span>
+        </button>
+        ${!isFolder ? `
+            <button class="download-btn w-full text-left px-4 py-2 hover:bg-gray-100 flex items-center space-x-2 text-gray-800" data-file-id="${fileId}">
+                <span>⬇️</span><span>${window.I18N.fileFolder.download}</span>
+            </button>
+        ` : ''}
+    `;
+    
+    document.body.appendChild(menu);
+    
+    // Add event listeners to menu buttons
+    const copyBtn = menu.querySelector('.copy-btn');
+    const downloadBtn = menu.querySelector('.download-btn');
+    
+    if (copyBtn) {
+        copyBtn.addEventListener('click', async (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            menu.remove();
+            await copySharedFileToMyBucket(fileId);
+        });
+    }
+    
+    if (downloadBtn) {
+        downloadBtn.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            menu.remove();
+            downloadSharedFile(fileId);
+        });
+    }
+    
+    // Close menu when clicking outside
+    setTimeout(() => {
+        document.addEventListener('click', function closeMenu(e) {
+            if (!menu.contains(e.target)) {
+                menu.remove();
+                document.removeEventListener('click', closeMenu);
+            }
+        });
+    }, 0);
+}
+
+/**
+ * Copy shared file to user's bucket
+ */
+async function copySharedFileToMyBucket(fileId) {
+    try {
+        // Show loading indicator
+        const loadingId = 'copy-loading-' + fileId;
+        const loadingDiv = document.createElement('div');
+        loadingDiv.id = loadingId;
+        loadingDiv.className = 'fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50';
+        loadingDiv.innerHTML = `
+            <div class="bg-white rounded-lg p-6 flex flex-col items-center space-y-3">
+                <div class="animate-spin">
+                    <svg class="w-8 h-8 text-[#f89c00]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
+                    </svg>
+                </div>
+                <p class="text-gray-800 font-medium">${window.I18N.fileFolder.msgCopying || 'Copying...'}</p>
+            </div>
+        `;
+        document.body.appendChild(loadingDiv);
+        
+        const response = await fetch(`/api/shared-files/${fileId}/copy`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]')?.getAttribute('content') || '',
+                'X-Requested-With': 'XMLHttpRequest'
+            },
+            credentials: 'same-origin'
+        });
+        
+        // Remove loading indicator
+        const loadingElement = document.getElementById(loadingId);
+        if (loadingElement) loadingElement.remove();
+        
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.message || 'Failed to copy file');
+        }
+        
+        const data = await response.json();
+        
+        if (data.success) {
+            showNotification('✅ ' + (window.I18N.fileFolder.msgCopySuccess || 'File copied!'), 'success');
+            // Reload shared files to show updated list
+            setTimeout(() => {
+                loadUserFiles();
+            }, 1000);
+        } else {
+            showNotification('❌ ' + (data.message || 'Failed to copy file'), 'error');
+        }
+    } catch (error) {
+        console.error('Error copying file:', error);
+        showNotification('❌ Error: ' + error.message, 'error');
+        // Remove loading indicator if still present
+        const loadingElement = document.getElementById('copy-loading-' + fileId);
+        if (loadingElement) loadingElement.remove();
+    }
+}
+
+/**
+ * Download shared file
+ */
+function downloadSharedFile(fileId) {
+    // Trigger download via API or direct link
+    window.location.href = `/api/shared-files/${fileId}/download`;
+}
+
+/**
+ * Get SVG icon for file type
+ */
+function getFileIconSvg(fileName, isFolder) {
+    if (isFolder) {
+        return `
+            <svg class="w-6 h-6 text-[#f89c00]" fill="currentColor" viewBox="0 0 24 24">
+                <path d="M10 4H4c-1.11 0-2 .89-2 2v12c0 1.11.89 2 2 2h16c1.11 0 2-.89 2-2V8c0-1.11-.89-2-2-2h-8l-2-2z"/>
+            </svg>
+        `;
+    }
+    
+    const extension = fileName.split('.').pop()?.toLowerCase() || '';
+    
+    // Document files
+    if (['doc', 'docx', 'txt', 'rtf'].includes(extension)) {
+        return `
+            <svg class="w-6 h-6 text-blue-500" fill="currentColor" viewBox="0 0 24 24">
+                <path d="M14,2H6A2,2 0 0,0 4,4V20A2,2 0 0,0 6,22H18A2,2 0 0,0 20,20V8L14,2M18,20H6V4H13V9H18V20Z"/>
+            </svg>
+        `;
+    }
+    
+    // Spreadsheet files
+    if (['xls', 'xlsx', 'csv'].includes(extension)) {
+        return `
+            <svg class="w-6 h-6 text-green-500" fill="currentColor" viewBox="0 0 24 24">
+                <path d="M14,2H6A2,2 0 0,0 4,4V20A2,2 0 0,0 6,22H18A2,2 0 0,0 20,20V8L14,2M18,20H6V4H13V9H18V20Z"/>
+            </svg>
+        `;
+    }
+    
+    // PDF files
+    if (extension === 'pdf') {
+        return `
+            <svg class="w-6 h-6 text-red-500" fill="currentColor" viewBox="0 0 24 24">
+                <path d="M14,2H6A2,2 0 0,0 4,4V20A2,2 0 0,0 6,22H18A2,2 0 0,0 20,20V8L14,2M18,20H6V4H13V9H18V20Z"/>
+            </svg>
+        `;
+    }
+    
+    // Image files
+    if (['jpg', 'jpeg', 'png', 'gif', 'bmp', 'svg', 'webp'].includes(extension)) {
+        return `
+            <svg class="w-6 h-6 text-purple-500" fill="currentColor" viewBox="0 0 24 24">
+                <path d="M8.5,13.5L11,16.5L14.5,12L19,18H5M21,19V5C21,3.89 20.1,3 19,3H5A2,2 0 0,0 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19Z"/>
+            </svg>
+        `;
+    }
+    
+    // Default file icon
+    return `
+        <svg class="w-6 h-6 text-gray-400" fill="currentColor" viewBox="0 0 24 24">
+            <path d="M14,2H6A2,2 0 0,0 4,4V20A2,2 0 0,0 6,22H18A2,2 0 0,0 20,20V8L14,2M18,20H6V4H13V9H18V20Z"/>
+        </svg>
+    `;
+}
+
+/**
+ * Show loading state
+ */
+function showLoadingState() {
+    const container = document.getElementById('filesContainer');
+    if (!container) return;
+
+    container.innerHTML = `
+        <div class="bg-[#1F2235] rounded-lg border border-[#4A4D6A] overflow-hidden">
+            <div class="flex items-center justify-center py-16">
+                <div class="animate-spin rounded-full h-8 w-8 border-b-2 border-[#f89c00]"></div>
+                <span class="ml-3 text-gray-300">Loading shared files...</span>
+            </div>
+        </div>
+    `;
+}
+
+/**
+ * Handle sharing selected items from toolbar
+ */
+function handleSelectionShare() {
+    const selectedItems = Array.from(state.selectedItems);
+    
+    if (selectedItems.length === 0) {
+        showNotification('No items selected', 'error');
+        return;
+    }
+    
+    if (selectedItems.length > 1) {
+        showNotification(window.I18N?.fileFolder?.msgMoveLimit || 'Please select only one item', 'error');
+        return;
+    }
+    
+    const itemId = selectedItems[0];
+    showShareModal(itemId);
+}
+
+/**
+ * Handle downloading selected items from toolbar
+ */
+function handleSelectionDownload() {
+    const selectedItems = Array.from(state.selectedItems);
+    
+    if (selectedItems.length === 0) {
+        showNotification('No items selected', 'error');
+        return;
+    }
+    
+    // Download each selected item
+    selectedItems.forEach(itemId => {
+        const item = findItemById(itemId);
+        if (item) {
+            downloadFile(itemId, item.file_name);
+        }
+    });
+    
+    if (selectedItems.length > 1) {
+        showNotification(`${window.I18N?.fileFolder?.download || 'Downloading'} ${selectedItems.length} ${window.I18N?.fileFolder?.items || 'files'}...`, 'success');
+    }
+}
+
+/**
+ * Download a file using the existing download endpoint
+ */
+async function downloadFile(fileId, fileName) {
+    try {
+        const response = await fetch(`/files/${fileId}/download`, {
+            method: 'GET',
+            headers: {
+                'Accept': 'application/octet-stream',
+                'X-Requested-With': 'XMLHttpRequest',
+                'X-CSRF-TOKEN': getCsrfToken()
+            },
+            credentials: 'same-origin'
+        });
+
+        if (!response.ok) {
+            throw new Error('Download failed');
+        }
+
+        // Create blob and download
+        const blob = await response.blob();
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.style.display = 'none';
+        a.href = url;
+        a.download = fileName || 'download';
+        document.body.appendChild(a);
+        a.click();
+        window.URL.revokeObjectURL(url);
+        document.body.removeChild(a);
+
+    } catch (error) {
+        console.error('Download failed:', error);
+        showNotification(`${window.I18N?.fileFolder?.errorLoading || 'Failed'} ${fileName}`, 'error');
+    }
+}
+
+
+/**
+ * Helper function to calculate days until expiry
+ */
+function getDaysUntilExpiry(expiryDate) {
+    if (!expiryDate) return null;
+    const expiry = new Date(expiryDate);
+    const now = new Date();
+    const diffTime = expiry - now;
+    return Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+}
+
+// Export functions to global scope for testing and external access
+window.showRenameModal = showRenameModal;
+window.showShareModal = showShareModal;
+window.renameItem = renameItem;
+window.loadSharedFiles = loadSharedFiles;

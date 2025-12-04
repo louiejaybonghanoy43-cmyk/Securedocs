@@ -1,0 +1,140 @@
+<div class="settings-form-wrapper">
+<x-action-section>
+    <x-slot name="title">
+        <span class="settings-title">{{ __('auth.2fa_title') }}</span>
+    </x-slot>
+
+    <x-slot name="description">
+        <span class="settings-description">{{ __('auth.2fa_desc') }}</span>
+    </x-slot>
+
+    <x-slot name="content">
+        <h3 class="settings-label text-lg font-medium">
+            @if ($this->enabled)
+                @if ($showingConfirmation)
+                    {{ __('auth.2fa_finish_enabling') }}
+                @else
+                    {{ __('auth.2fa_enabled') }}
+                @endif
+            @else
+                {{ __('auth.2fa_not_enabled') }}
+            @endif
+        </h3>
+
+        <div class="mt-3 max-w-xl text-sm">
+            <p class="settings-description">
+                {{ __('auth.2fa_instruction') }}
+            </p>
+        </div>
+
+        @if ($this->enabled)
+            @if ($showingQrCode)
+                <div class="mt-4 max-w-xl text-sm">
+                    <p class="settings-description">
+                        @if ($showingConfirmation)
+                            {{ __('auth.2fa_finish_instruction') }}
+                        @else
+                            {{ __('auth.2fa_enabled_instruction') }}
+                        @endif
+                    </p>
+                </div>
+
+                <div class="mt-4 p-2 inline-block bg-white">
+                    {!! $this->user->twoFactorQrCodeSvg() !!}
+                </div>
+
+                <div class="mt-4 max-w-xl text-sm text-gray-600">
+                    <p class="font-semibold">
+                    {{ __('auth.2fa_setup_key') }}: {{ decrypt($this->user->two_factor_secret) }}                    </p>
+                </div>
+
+                @if ($showingConfirmation)
+                    <div class="mt-4">
+                        <x-label for="code" class="settings-label" value="{{ __('auth.2fa_code') }}" />
+                        <x-input id="code" type="text" name="code" class="block mt-1 w-1/2" inputmode="numeric" autofocus autocomplete="one-time-code"
+                            wire:model="code"
+                            wire:keydown.enter="confirmTwoFactorAuthentication" />
+
+                        <x-input-error for="code" class="mt-2" />
+                    </div>
+                @endif
+            @endif
+
+            @if ($showingRecoveryCodes)
+                <div class="mt-4 max-w-xl text-sm">
+                    <p class="settings-description font-semibold">
+                        {{ __('auth.2fa_recovery_codes_instruction') }}
+                    </p>
+                </div>
+
+                <div class="grid gap-1 max-w-xl mt-4 px-4 py-4 font-mono text-sm bg-[#1D1D2F] rounded-lg">
+                    @foreach (json_decode(decrypt($this->user->two_factor_recovery_codes), true) as $code)
+                        <div>{{ $code }}</div>
+                    @endforeach
+                </div>
+            @endif
+        @endif
+
+        <div class="mt-5">
+            @if (! $this->enabled)
+                <x-confirms-password wire:then="enableTwoFactorAuthentication">
+                    <x-button type="button" class="settings-button" wire:loading.attr="disabled">
+                        {{ __('auth.2fa_enable') }}
+                    </x-button>
+                </x-confirms-password>
+            @else
+            @if ($showingRecoveryCodes)
+                    <x-confirms-password wire:then="regenerateRecoveryCodes">
+                        <x-secondary-button class="me-3">
+                            {{ __('auth.2fa_regenerate_recovery_codes') }}
+                        </x-secondary-button>
+                    </x-confirms-password>
+                @elseif ($showingConfirmation)
+                    <x-confirms-password wire:then="confirmTwoFactorAuthentication">
+                        <x-button type="button" class="settings-button me-3 transition-all duration-200 focus:ring-2 focus:ring-orange-500 focus:ring-offset-2 disabled:opacity-60 disabled:cursor-not-allowed" wire:loading.attr="disabled">
+                            {{ __('auth.2fa_confirm') }}
+                        </x-button>
+                    </x-confirms-password>
+                @else
+                    <x-confirms-password wire:then="showRecoveryCodes">
+                        <x-secondary-button class="me-3">
+                            {{ __('auth.2fa_show_recovery_codes') }}
+                        </x-secondary-button>
+                    </x-confirms-password>
+                @endif
+
+                @if ($showingConfirmation)
+                    <x-confirms-password wire:then="disableTwoFactorAuthentication">
+                        <x-secondary-button wire:loading.attr="disabled">
+                            {{ __('auth.2fa_cancel') }}
+                        </x-secondary-button>
+                    </x-confirms-password>
+                @else
+                    <x-confirms-password wire:then="disableTwoFactorAuthentication">
+                        <x-danger-button wire:loading.attr="disabled">
+                            {{ __('auth.2fa_disable') }}
+                        </x-danger-button>
+                    </x-confirms-password>
+                @endif
+
+            @endif
+        </div>
+    </x-slot>
+</x-action-section>
+
+
+<style>
+    .settings-form-wrapper .enable-2fa-button,
+    .settings-form-wrapper button.enable-2fa-button {
+        background-color: #f89c00 !important; 
+        color: #000000 !important; 
+        border-color: #f89c00 !important;
+    }
+
+    .settings-form-wrapper .enable-2fa-button *,
+    .settings-form-wrapper button.enable-2fa-button * {
+        color: #000000 !important;
+    }
+
+</style>
+</div>

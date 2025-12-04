@@ -1,0 +1,82 @@
+<?php
+
+return [
+
+    /*
+    |--------------------------------------------------------------------------
+    | Third Party Services
+    |--------------------------------------------------------------------------
+    |
+    | This file is for storing the credentials for third party services such
+    | as Mailgun, Postmark, AWS and more. This file provides the de facto
+    | location for this type of information, allowing packages to have
+    | a conventional file to locate the various service credentials.
+    |
+    */
+
+    'mailgun' => [
+        'domain' => env('MAILGUN_DOMAIN'),
+        'secret' => env('MAILGUN_SECRET'),
+        'endpoint' => env('MAILGUN_ENDPOINT', 'api.mailgun.net'),
+        'scheme' => 'https',
+    ],
+
+    'n8n' => [
+        //webhook for vectorization
+        'webhook_url' => env('N8N_WEBHOOK_URL'),
+        'default_chat_webhook' => env('N8N_DEFAULT_CHAT_WEBHOOK_URL'),
+        'premium_chat_webhook' => env('N8N_PREMIUM_CHAT_WEBHOOK_URL'),
+        // Used by SendFileToN8n job; maps to general webhook for premium processing
+        'premium_webhook_url' => env('N8N_WEBHOOK_URL'),
+    ],
+
+    'postmark' => [
+        'token' => env('POSTMARK_TOKEN'),
+    ],
+
+    'ses' => [
+        'key' => env('AWS_ACCESS_KEY_ID'),
+        'secret' => env('AWS_SECRET_ACCESS_KEY'),
+        'region' => env('AWS_DEFAULT_REGION', 'us-east-1'),
+    ],
+
+    'resend' => [
+        'key' => env('RESEND_KEY'),
+    ],
+
+    'slack' => [
+        'notifications' => [
+            'bot_user_oauth_token' => env('SLACK_BOT_USER_OAUTH_TOKEN'),
+            'channel' => env('SLACK_BOT_USER_DEFAULT_CHANNEL'),
+        ],
+    ],
+    'supabase' => [
+        'url' => env('SUPABASE_URL'),
+        'key' => env('SUPABASE_KEY'), // anon/public key for frontend
+        'service_key' => env('SUPABASE_SERVICE_ROLE_KEY'), // service role for backend operations
+    ],
+
+    'bundler' => [
+        'url' => env('BUNDLER_URL', 'https://node1.bundlr.network'),
+        'api_key' => env('BUNDLER_API_KEY'),
+        'enabled' => env('BUNDLER_ENABLED', true),
+    ],
+
+    'stripe' => [
+        'key' => env('STRIPE_KEY'),
+        'secret' => env('STRIPE_SECRET'),
+        'webhook_secret' => env('STRIPE_WEBHOOK_SECRET'),
+    ],
+
+    'paypal' => [
+        'client_id' => env('PAYPAL_CLIENT_ID'),
+        'client_secret' => env('PAYPAL_CLIENT_SECRET'),
+        'mode' => env('PAYPAL_MODE', 'sandbox'), // sandbox or live
+    ],
+
+    'ai_categorization' => [
+        'enabled' => env('AI_CATEGORIZATION_ENABLED', false), // Set to false to disable AI categorization polling
+        'polling_interval' => env('AI_CATEGORIZATION_POLLING_INTERVAL', 3000), // milliseconds
+    ],
+
+];

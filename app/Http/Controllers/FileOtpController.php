@@ -1,0 +1,654 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\File;
+use App\Models\PermanentStorage;
+use App\Models\FileOtpSecurity;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Mail;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Validation\ValidationException;
+
+class FileOtpController extends Controller
+{
+    public function __construct()
+    {
+        $this->middleware(['auth', 'verified']);
+    }
+
+    /**
+     * Enable OTP protection for a file
+     */
+    public function enableOtp(Request $request): JsonResponse
+    {
+        try {
+            $request->validate([
+                'file_type' => 'required|in:regular,permanent',
+                'file_id' => 'required|integer',
+                'require_otp_for_download' => 'boolean',
+                'require_otp_for_preview' => 'boolean',
+                'require_otp_for_arweave_upload' => 'boolean',
+                'require_otp_for_ai_share' => 'boolean',
+                'otp_valid_duration_minutes' => 'integer|min:5|max:60'
+            ]);
+
+            $user = Auth::user();
+            
+            // Additional email verification check with better error message
+            if (!$user->hasVerifiedEmail()) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Please verify your email address before using OTP security features',
+                    'requires_verification' => true
+                ], 403);
+            }
+            
+            Log::info('OTP Enable Request', [
+                'user_id' => $user->id,
+                'file_type' => $request->file_type,
+                'file_id' => $request->file_id,
+                'request_data' => $request->all()
+            ]);
+            
+            // Verify file ownership
+            if ($request->file_type === 'regular') {
+                $file = File::where('id', $request->file_id)
+                    ->where('user_id', $user->id)
+                    ->first();
+                
+                if (!$file) {
+                    Log::error('File not found for OTP enable', [
+                        'user_id' => $user->id,
+                        'file_id' => $request->file_id
+                    ]);
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'File not found or access denied'
+                    ], 404);
+                }
+                
+                // Mark file as confidential - use raw SQL to handle PostgreSQL boolean casting
+                DB::table('files')
+                    ->where('id', $file->id)
+                    ->update([
+                        'is_confidential' => DB::raw('true'),
+                        'confidential_enabled_at' => now(),
+                        'updated_at' => now()
+                    ]);
+                
+                $fileId = $file->id;
+                $permanentStorageId = null;
+            } else {
+                $permanentFile = PermanentStorage::where('id', $request->file_id)
+                    ->where('user_id', $user->id)
+                    ->firstOrFail();
+                
+                $fileId = null;
+                $permanentStorageId = $permanentFile->id;
+            }
+
+            // Create or update OTP security record
+            Log::info('Creating OTP security record', [
+                'user_id' => $user->id,
+                'file_id' => $fileId,
+                'permanent_storage_id' => $permanentStorageId,
+                'settings' => [
+                    'require_otp_for_download' => $request->get('require_otp_for_download', true),
+                    'require_otp_for_preview' => $request->get('require_otp_for_preview', false),
+                    'require_otp_for_arweave_upload' => $request->get('require_otp_for_arweave_upload', false),
+                    'require_otp_for_ai_share' => $request->get('require_otp_for_ai_share', false),
+                    'otp_valid_duration_minutes' => $request->get('otp_valid_duration_minutes', 10),
+                ]
+            ]);
+            
+            $otpSecurity = FileOtpSecurity::updateOrCreate(
+                [
+                    'user_id' => $user->id,
+                    'file_id' => $fileId,
+                    'permanent_storage_id' => $permanentStorageId,
+                ],
+                [
+                    'is_otp_enabled' => DB::raw('true'),
+                    'require_otp_for_download' => $request->get('require_otp_for_download', true) ? DB::raw('true') : DB::raw('false'),
+                    'require_otp_for_preview' => $request->get('require_otp_for_preview', false) ? DB::raw('true') : DB::raw('false'),
+                    'require_otp_for_arweave_upload' => $request->get('require_otp_for_arweave_upload', false) ? DB::raw('true') : DB::raw('false'),
+                    'require_otp_for_ai_share' => $request->get('require_otp_for_ai_share', false) ? DB::raw('true') : DB::raw('false'),
+                    'otp_valid_duration_minutes' => $request->get('otp_valid_duration_minutes', 10),
+                    'max_otp_attempts' => 3
+                ]
+            );
+            
+            Log::info('OTP security record created/updated', [
+                'otp_security_id' => $otpSecurity->id,
+                'is_otp_enabled' => $otpSecurity->is_otp_enabled
+            ]);
+
+            return response()->json([
+                'success' => true,
+                'message' => 'OTP protection enabled successfully',
+                'otp_security' => [
+                    'id' => $otpSecurity->id,
+                    'is_otp_enabled' => $otpSecurity->is_otp_enabled,
+                    'require_otp_for_download' => $otpSecurity->require_otp_for_download,
+                    'require_otp_for_preview' => $otpSecurity->require_otp_for_preview,
+                    'require_otp_for_arweave_upload' => $otpSecurity->require_otp_for_arweave_upload,
+                    'require_otp_for_ai_share' => $otpSecurity->require_otp_for_ai_share,
+                    'otp_valid_duration_minutes' => $otpSecurity->otp_valid_duration_minutes,
+                ]
+            ]);
+
+        } catch (\Exception $e) {
+            Log::error('Failed to enable OTP protection', [
+                'error' => $e->getMessage(),
+                'user_id' => Auth::id()
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to enable OTP protection'
+            ], 500);
+        }
+    }
+
+    /**
+     * Disable OTP protection for a file
+     */
+    public function disableOtp(Request $request): JsonResponse
+    {
+        try {
+            $request->validate([
+                'file_type' => 'required|in:regular,permanent',
+                'file_id' => 'required|integer',
+                'otp_code' => 'required|string|size:6'
+            ]);
+
+            $user = Auth::user();
+            
+            // Find and verify OTP first
+            if ($request->file_type === 'regular') {
+                $otpSecurity = FileOtpSecurity::where('user_id', $user->id)
+                    ->where('file_id', $request->file_id)
+                    ->where('is_otp_enabled', DB::raw('true'))
+                    ->first();
+            } else {
+                $otpSecurity = FileOtpSecurity::where('user_id', $user->id)
+                    ->where('permanent_storage_id', $request->file_id)
+                    ->where('is_otp_enabled', DB::raw('true'))
+                    ->first();
+            }
+            
+            if (!$otpSecurity) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'OTP protection is not enabled for this file'
+                ], 400);
+            }
+            
+            // Verify OTP code before disabling
+            if (!$otpSecurity->verifyOtp($request->otp_code)) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Invalid or expired OTP code',
+                    'remaining_attempts' => $otpSecurity->remaining_attempts
+                ], 400);
+            }
+            
+            // OTP verified, now disable protection
+            if ($request->file_type === 'regular') {
+                // Remove confidential flag from regular file
+                DB::table('files')
+                    ->where('id', $request->file_id)
+                    ->where('user_id', $user->id)
+                    ->update([
+                        'is_confidential' => DB::raw('false'),
+                        'confidential_enabled_at' => null,
+                        'updated_at' => now()
+                    ]);
+            }
+
+            // Disable OTP protection
+            $otpSecurity->update(['is_otp_enabled' => DB::raw('false')]);
+
+            return response()->json([
+                'success' => true,
+                'message' => 'OTP protection disabled successfully'
+            ]);
+
+        } catch (\Exception $e) {
+            Log::error('Failed to disable OTP protection', [
+                'error' => $e->getMessage(),
+                'user_id' => Auth::id()
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to disable OTP protection'
+            ], 500);
+        }
+    }
+
+    /**
+     * Send OTP to user's email
+     */
+    public function sendOtp(Request $request): JsonResponse
+    {
+        try {
+            $request->validate([
+                'file_type' => 'required|in:regular,permanent',
+                'file_id' => 'required|integer'
+            ]);
+
+            $user = Auth::user();
+            
+            // Additional email verification check
+            if (!$user->hasVerifiedEmail()) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Please verify your email address before using OTP security features',
+                    'requires_verification' => true
+                ], 403);
+            }
+            
+            // Find OTP security record
+            if ($request->file_type === 'regular') {
+                $otpSecurity = FileOtpSecurity::where('user_id', $user->id)
+                    ->where('file_id', $request->file_id)
+                    ->where('is_otp_enabled', DB::raw('true'))
+                    ->firstOrFail();
+            } else {
+                $otpSecurity = FileOtpSecurity::where('user_id', $user->id)
+                    ->where('permanent_storage_id', $request->file_id)
+                    ->where('is_otp_enabled', DB::raw('true'))
+                    ->firstOrFail();
+            }
+
+            // Check rate limiting
+            if (!$otpSecurity->canSendOtp()) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Please wait before requesting another OTP'
+                ], 429);
+            }
+
+            // Generate OTP
+            $otp = $otpSecurity->generateOtp();
+
+            // Send email with beautiful template
+            $this->sendOtpEmail($user, $otpSecurity->file_name, $otp, $otpSecurity->otp_valid_duration_minutes);
+
+            return response()->json([
+                'success' => true,
+                'message' => 'OTP sent to your email address',
+                'expires_in_minutes' => $otpSecurity->otp_valid_duration_minutes,
+                'remaining_attempts' => $otpSecurity->max_otp_attempts
+            ]);
+
+        } catch (\Exception $e) {
+            Log::error('Failed to send OTP', [
+                'error' => $e->getMessage(),
+                'user_id' => Auth::id()
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to send OTP'
+            ], 500);
+        }
+    }
+
+    /**
+     * Verify OTP code
+     */
+    public function verifyOtp(Request $request): JsonResponse
+    {
+        try {
+            $request->validate([
+                'file_type' => 'required|in:regular,permanent',
+                'file_id' => 'required|integer',
+                'otp_code' => 'required|string|size:6'
+            ]);
+
+            $user = Auth::user();
+            
+            // Find OTP security record
+            if ($request->file_type === 'regular') {
+                $otpSecurity = FileOtpSecurity::where('user_id', $user->id)
+                    ->where('file_id', $request->file_id)
+                    ->where('is_otp_enabled', DB::raw('true'))
+                    ->firstOrFail();
+            } else {
+                $otpSecurity = FileOtpSecurity::where('user_id', $user->id)
+                    ->where('permanent_storage_id', $request->file_id)
+                    ->where('is_otp_enabled', DB::raw('true'))
+                    ->firstOrFail();
+            }
+
+            // Verify OTP
+            $isValid = $otpSecurity->verifyOtp($request->otp_code);
+
+            if ($isValid) {
+                // Set session to allow file access for the specified duration
+                $fileId = $request->file_type === 'regular' ? $request->file_id : null;
+                $permanentId = $request->file_type === 'permanent' ? $request->file_id : null;
+                
+                $sessionTime = now();
+                
+                if ($fileId) {
+                    session(["otp_verified_file_{$fileId}" => $sessionTime]);
+                    Log::info('OTP Session Set', [
+                        'file_id' => $fileId,
+                        'session_key' => "otp_verified_file_{$fileId}",
+                        'session_time' => $sessionTime->toISOString(),
+                        'duration_minutes' => $otpSecurity->otp_valid_duration_minutes
+                    ]);
+                }
+                if ($permanentId) {
+                    session(["otp_verified_permanent_{$permanentId}" => $sessionTime]);
+                }
+                
+                return response()->json([
+                    'success' => true,
+                    'message' => 'OTP verified successfully',
+                    'expires_in_minutes' => $otpSecurity->otp_valid_duration_minutes
+                ]);
+            } else {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Invalid or expired OTP',
+                    'remaining_attempts' => $otpSecurity->remaining_attempts
+                ], 400);
+            }
+
+        } catch (\Exception $e) {
+            Log::error('Failed to verify OTP', [
+                'error' => $e->getMessage(),
+                'user_id' => Auth::id()
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to verify OTP'
+            ], 500);
+        }
+    }
+
+    /**
+     * Check if user can access OTP features (email verified)
+     */
+    public function checkOtpAccess(): JsonResponse
+    {
+        $user = Auth::user();
+        
+        return response()->json([
+            'success' => true,
+            'can_use_otp' => $user->hasVerifiedEmail(),
+            'email_verified' => $user->hasVerifiedEmail(),
+            'message' => $user->hasVerifiedEmail() 
+                ? 'OTP features are available' 
+                : 'Please verify your email address to use OTP security features'
+        ]);
+    }
+
+    /**
+     * Check if OTP is required for a specific file action
+     */
+    public function checkAccess(Request $request): JsonResponse
+    {
+        try {
+            $request->validate([
+                'file_id' => 'required|integer',
+                'action' => 'required|string|in:download,preview,arweave_upload,ai_share'
+            ]);
+
+            $user = Auth::user();
+            $fileId = $request->integer('file_id');
+            $action = $request->string('action')->value();
+
+            // Find the OTP security record for this file
+            $otpSecurity = FileOtpSecurity::where('user_id', $user->id)
+                ->where('file_id', $fileId)
+                ->first();
+
+            // If no OTP security record exists, OTP is not required
+            if (!$otpSecurity || !$otpSecurity->is_otp_enabled) {
+                return response()->json([
+                    'success' => true,
+                    'requires_otp' => false,
+                    'otp_verified' => false,
+                    'message' => 'OTP not required for this file'
+                ]);
+            }
+
+            // Check if OTP is required for this specific action
+            $isOtpRequired = $otpSecurity->isOtpRequiredFor($action);
+
+            if (!$isOtpRequired) {
+                return response()->json([
+                    'success' => true,
+                    'requires_otp' => false,
+                    'otp_verified' => false,
+                    'message' => "OTP not required for {$action}"
+                ]);
+            }
+
+            // Check if OTP has been verified in this session
+            $sessionKey = "otp_verified_file_{$fileId}";
+            $otpVerifiedTime = session($sessionKey);
+
+            if ($otpVerifiedTime) {
+                $verifiedAt = \Carbon\Carbon::parse($otpVerifiedTime);
+                $expiresAt = $verifiedAt->addMinutes($otpSecurity->otp_valid_duration_minutes);
+
+                if (now()->isBefore($expiresAt)) {
+                    // OTP is still valid
+                    return response()->json([
+                        'success' => true,
+                        'requires_otp' => true,
+                        'otp_verified' => true,
+                        'expires_at' => $expiresAt->toISOString(),
+                        'message' => 'OTP already verified'
+                    ]);
+                }
+            }
+
+            // OTP is required but not verified
+            return response()->json([
+                'success' => true,
+                'requires_otp' => true,
+                'otp_verified' => false,
+                'message' => "OTP verification required for {$action}"
+            ]);
+
+        } catch (\Exception $e) {
+            Log::error('Failed to check OTP access', [
+                'error' => $e->getMessage(),
+                'user_id' => Auth::id()
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to check OTP access'
+            ], 500);
+        }
+    }
+
+    /**
+     * Get OTP status for a file
+     */
+    public function getOtpStatus(Request $request): JsonResponse
+    {
+        try {
+            $request->validate([
+                'file_type' => 'required|in:regular,permanent',
+                'file_id' => 'required|integer'
+            ]);
+
+            $user = Auth::user();
+            
+            if ($request->file_type === 'regular') {
+                $otpSecurity = FileOtpSecurity::where('user_id', $user->id)
+                    ->where('file_id', $request->file_id)
+                    ->first();
+            } else {
+                $otpSecurity = FileOtpSecurity::where('user_id', $user->id)
+                    ->where('permanent_storage_id', $request->file_id)
+                    ->first();
+            }
+
+            if (!$otpSecurity) {
+                return response()->json([
+                    'success' => true,
+                    'otp_enabled' => false
+                ]);
+            }
+
+            return response()->json([
+                'success' => true,
+                'otp_enabled' => $otpSecurity->is_otp_enabled,
+                'require_otp_for_download' => $otpSecurity->require_otp_for_download,
+                'require_otp_for_preview' => $otpSecurity->require_otp_for_preview,
+                'require_otp_for_arweave_upload' => $otpSecurity->require_otp_for_arweave_upload,
+                'require_otp_for_ai_share' => $otpSecurity->require_otp_for_ai_share,
+                'otp_valid_duration_minutes' => $otpSecurity->otp_valid_duration_minutes,
+                'total_access_count' => $otpSecurity->total_access_count,
+                'last_successful_access_at' => $otpSecurity->last_successful_access_at?->toISOString(),
+            ]);
+
+        } catch (\Exception $e) {
+            Log::error('Failed to get OTP status', [
+                'error' => $e->getMessage(),
+                'user_id' => Auth::id()
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to get OTP status'
+            ], 500);
+        }
+    }
+
+    /**
+     * Send OTP email with beautiful template
+     */
+    private function sendOtpEmail($user, $fileName, $otp, $expiryMinutes = 10): void
+    {
+        try {
+            // Send email using the beautiful template
+            Mail::send('emails.otp-verification', [
+                'user' => $user,
+                'fileName' => $fileName,
+                'otp' => $otp,
+                'expiryMinutes' => $expiryMinutes
+            ], function ($message) use ($user, $fileName) {
+                $message->to($user->email, $user->name)
+                        ->subject("🔐 SecureDocs - File Access OTP for {$fileName}");
+            });
+
+            Log::info('OTP Email Sent Successfully', [
+                'user_email' => $user->email,
+                'file_name' => $fileName,
+                'otp_code' => $otp,
+                'template' => 'emails.otp-verification'
+            ]);
+        } catch (\Exception $e) {
+            Log::error('Failed to send OTP email', [
+                'user_email' => $user->email,
+                'file_name' => $fileName,
+                'error' => $e->getMessage()
+            ]);
+            throw $e;
+        }
+    }
+
+    /**
+     * Delete shared link for a file
+     */
+    public function deleteSharedLink(Request $request): JsonResponse
+    {
+        try {
+            $request->validate([
+                'file_type' => 'required|in:regular,permanent',
+                'file_id' => 'required|integer'
+            ]);
+
+            $user = Auth::user();
+
+            if ($request->file_type === 'regular') {
+                $file = File::where('id', $request->file_id)
+                    ->where('user_id', $user->id)
+                    ->first();
+
+                if (!$file) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'File not found or access denied'
+                    ], 404);
+                }
+
+                // Clear the share_token to disable sharing
+                $file->share_token = null;
+                $file->save();
+
+                Log::info('Shared link deleted for file', [
+                    'user_id' => $user->id,
+                    'file_id' => $file->id,
+                    'file_name' => $file->file_name
+                ]);
+            } else {
+                $permanentFile = PermanentStorage::where('id', $request->file_id)
+                    ->where('user_id', $user->id)
+                    ->first();
+
+                if (!$permanentFile) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'File not found or access denied'
+                    ], 404);
+                }
+
+                // Clear the share_token to disable sharing
+                $permanentFile->share_token = null;
+                $permanentFile->save();
+
+                Log::info('Shared link deleted for permanent storage file', [
+                    'user_id' => $user->id,
+                    'permanent_storage_id' => $permanentFile->id,
+                    'file_name' => $permanentFile->file_name
+                ]);
+            }
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Shared link deleted successfully'
+            ]);
+
+        } catch (\Exception $e) {
+            Log::error('Failed to delete shared link', [
+                'error' => $e->getMessage(),
+                'user_id' => Auth::id()
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to delete shared link'
+            ], 500);
+        }
+    }
+
+    /**
+     * Generate access token for verified OTP
+     */
+    private function generateAccessToken($otpSecurity): string
+    {
+        return base64_encode(json_encode([
+            'otp_security_id' => $otpSecurity->id,
+            'user_id' => $otpSecurity->user_id,
+            'expires_at' => now()->addMinutes(30)->timestamp,
+            'signature' => hash_hmac('sha256', $otpSecurity->id . $otpSecurity->user_id, config('app.key'))
+        ]));
+    }
+}

@@ -1,0 +1,52 @@
+/.phpunit.cache
+/node_modules
+/public/build
+/public/hot
+/public/storage
+/storage/*.key
+/storage/pail
+/vendor
+.env
+.venv
+.env.backup
+.env.production
+.env.local
+.env.development
+.phpactor.json
+.phpunit.result.cache
+Homestead.json
+Homestead.yaml
+npm-debug.log
+yarn-error.log
+/auth.json
+/.fleet
+/.idea
+/.nova
+/.vscode
+/.zed
+storage/logs/laravel.log
+/.kiro
+# Python Virtual Environments
+test-automation/python/venv/
+test-automation/python/__pycache__/
+test-automation/python/*.pyc
+test-automation/python/*.pyo
+test-automation/python/.pytest_cache/
+
+# Test Reports and Artifacts
+test-automation/reports/
+test-automation/screenshots/
+test-automation/allure-results/
+test-automation/test-output/
+
+# IDE files for test automation
+test-automation/.idea/
+test-automation/.vscode/
+test-automation/*.iml
+tests/unit testing/__pycache__/global_session.cpython-311.pyc
+tests/unit testing/__pycache__/webdriver_utils.cpython-311.pyc
+tests/unit testing/webdriver_utils.py
+tests/unit testing/User_Profile_Module/__pycache__/UP-B_003_breadcrumb_navigation.cpython-311.pyc
+tests/unit testing/User_Profile_Module/UP-B_003_breadcrumb_navigation.py
+tests/unit testing/__pycache__/webdriver_utils.cpython-311.pyc
+tests/unit testing/__pycache__/global_session.cpython-311.pyc

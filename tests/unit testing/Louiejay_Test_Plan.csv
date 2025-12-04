@@ -1,0 +1,21 @@
+Test Case ID,Module Name,Unit Name,Priority,Test Case Description,Expected Result,Actual Result,Result,Points
+UP-UD_001,User Profile,User Dashboard,High,Validate dashboard loads with user stats,Dashboard displays storage usage and recent files,passed,passed,1
+UP-N_002,User Profile,Navigation,High,Validate main navigation menu works,All menu items clickable and redirect correctly,passed,passed,1
+UP-B_003,User Profile,Breadcrumbs,High,Validate breadcrumb navigation in folders,Breadcrumbs update correctly when navigating,passed,passed,1
+UP-LS_004,User Profile,Language Switch,High,Validate language switching (EN/Filipino),Interface language changes correctly,TBD,TBD,1
+DM-FU_001,Document Management,File Upload,High,Validate single file upload functionality,File uploaded successfully to current folder,passed,passed,1
+DM-FU_002,Document Management,File Upload,High,Validate multiple file upload,All selected files uploaded successfully,TBD,TBD,1
+DM-FU_003,Document Management,File Upload,High,Validate file type restrictions,Invalid file types rejected with error message,passed,passed,1
+DM-FU_004,Document Management,File Upload,High,Validate file size limits,Large files rejected with size limit message,TBD,TBD,1
+DM-FD_005,Document Management,File Download,High,Validate file download functionality,File downloads correctly with original name,TBD,TBD,1
+DM-FP_006,Document Management,File Preview,High,Validate file preview for supported formats,Preview modal opens with file content,TBD,TBD,1
+DM-FR_007,Document Management,File Rename,High,Validate file renaming functionality,File renamed successfully,passed,passed,1
+DM-FD_008,Document Management,File Delete,High,Validate file soft delete (move to trash),File moved to trash and removed from main view,passed,passed,1
+DM-FR_009,Document Management,File Restore,High,Validate file restore from trash,File restored to original location,passed,passed,1
+DM-FPD_010,Document Management,File Permanent Delete,High,Validate permanent file deletion,File permanently deleted from system,passed,passed,1
+DM-FM_011,Document Management,Folder Management,High,Validate folder creation functionality,New folder created with specified name,TBD,TBD,1
+DM-FM_012,Document Management,Folder Management,High,Validate folder navigation,User can enter and browse folder contents,TBD,TBD,1
+DM-FM_013,Document Management,Folder Management,High,Validate folder renaming,Folder renamed successfully,passed,passed,1
+DM-FM_014,Document Management,Folder Management,High,Validate empty folder deletion,Empty folder deleted successfully,TBD,TBD,1
+DM-FM_015,Document Management,Folder Management,High,Validate non-empty folder deletion,Folder with contents moved to trash,TBD,TBD,1
+DM-FM_016,Document Management,Folder Management,High,Validate moving files between folders,Files moved successfully to target folder,TBD,TBD,1

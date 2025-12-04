@@ -1,0 +1,200 @@
+{
+  "name": "default chat bot",
+  "nodes": [
+    {
+      "parameters": {
+        "public": true,
+        "mode": "webhook",
+        "options": {
+          "allowedOrigins": "*"
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.chatTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        0
+      ],
+      "id": "b62da2db-02f1-44ac-976c-c07250fa3fdc",
+      "name": "When chat message received",
+      "webhookId": "0a216509-e55c-4a43-8d4a-581dffe09d18"
+    },
+    {
+      "parameters": {
+        "hasOutputParser": true,
+        "options": {
+          "systemMessage": "You are Tubby, a friendly and helpful AI assistant for SecureDocs.\nYour primary purpose is to assist users by answering questions about SecureDocs, troubleshooting issues, and explaining how the platform works.\n\n**Your Capabilities:**\n* **Answering Questions:** You provide accurate information regarding SecureDocs features, policies, and usage.\n* **No File Access:** You DO NOT have access to the user's file structure, you cannot list files, create folders, move items, or organize content.\n\n**Core Rules:**\n1.  **Tool Usage (Hidden):** When a user asks a question, you must ALWAYS use the `Read Google Docs` tool first to search the FAQ/Knowledge Base.\n    * *Critical:* NEVER mention the existence of the \"Google Docs tool\" or \"FAQ document\" to the user. Present the information naturally, as if you simply know the answer.\n    * *Bad:* \"I checked the Google Doc and it says...\"\n    * *Good:* \"To reset your password, you just need to...\"\n\n2.  **Source of Truth:**\n    * **If the answer is found in the tool:** Paraphrase it into a friendly, conversational response.\n    * **If the answer is NOT found:** You may provide general assistance based on common knowledge, but you must explicitly state, \"I don't have specific details on that right now, but generally...\"\n    * **Never make up facts:** If you don't know, admit it politely.\n\n3.  **Handling File Organization Requests (Premium Gatekeeping):**\n    * If a user asks you to list files, create folders, move documents, or \"organize my drive,\" you must politely refuse.\n    * Explain that you are the Standard Assistant and that automated file organization is available only in the **Premium** version of Tubby.\n    * *Example Response:* \"I'd love to help, but I don't have access to view or organize your personal files. That feature is available with the Premium version of SecureDocs. I can, however, answer any questions you have about how to organize them yourself!\"\n\n**Tone and Style:**\n* Be warm, professional, and concise.\n* Do not use technical jargon unless necessary.\n* Answer directly.\n\n**Available Tools:**\n* `Read Google Docs`: Search the internal knowledge base for answers. (Use this for every query)."
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.8,
+      "position": [
+        656,
+        0
+      ],
+      "id": "dcd2c297-4b79-4461-8220-db49af6e3ab1",
+      "name": "AI Agent"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        496,
+        240
+      ],
+      "id": "ab7b348e-5dc5-4768-84dd-a2876d7b2a6c",
+      "name": "Google Gemini Chat Model",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "dmzCbvQoM8H6zn5U",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "type": "@n8n/n8n-nodes-langchain.memoryPostgresChat",
+      "typeVersion": 1.3,
+      "position": [
+        656,
+        256
+      ],
+      "id": "fac3aba8-0d8b-49a1-8f03-c5357f2dcdeb",
+      "name": "Postgres Chat Memory",
+      "credentials": {
+        "postgres": {
+          "id": "6DV4Lpaee9pIhwtf",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "94af170d-28d0-4573-828e-31edb0259fc5",
+              "name": "user_id",
+              "value": "={{$json.metadata.userId}}",
+              "type": "string"
+            },
+            {
+              "id": "8f669da3-48c9-41e3-bce6-5758554d8402",
+              "name": "user_email",
+              "value": "={{$json.metadata.userEmail}}",
+              "type": "string"
+            },
+            {
+              "id": "1e2e3c49-0a43-4d49-bfc1-69c082d31a90",
+              "name": "user_name",
+              "value": "={{$json.metadata.userName}}",
+              "type": "string"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        384,
+        0
+      ],
+      "id": "aa3bf201-6d89-4d19-b9f4-df61fdc5c1d6",
+      "name": "Edit Fields"
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "documentURL": "https://docs.google.com/document/d/1NwRgU8yqDii57UUr9Y1tNirxHye7UKF93yNMNPV1Il8/edit?tab=t.0"
+      },
+      "type": "n8n-nodes-base.googleDocsTool",
+      "typeVersion": 2,
+      "position": [
+        848,
+        240
+      ],
+      "id": "34dd9851-34ac-4199-9a83-56a82ae00d60",
+      "name": "Get a document in Google Docs",
+      "credentials": {
+        "googleDocsOAuth2Api": {
+          "id": "CVPqxYxMRj1DgJC6",
+          "name": "Google Docs account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "When chat message received": {
+      "main": [
+        [
+          {
+            "node": "Edit Fields",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres Chat Memory": {
+      "ai_memory": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Edit Fields": {
+      "main": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get a document in Google Docs": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "bc8564a1-f9a2-467d-9231-362f4b88ab90",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "4d56fed8ea69872ea1358a3609a483698ef415603ed132cca879b0838ba1d0b9"
+  },
+  "id": "Za02YKCOqoiQuDZW",
+  "tags": []
+}
