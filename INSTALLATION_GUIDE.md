@@ -6,88 +6,20 @@ The following is the step-by-step procedure to set up SecureDocs on your local m
 
 | Step | Description |
 |------|-------------|
-| **1. Verify Prerequisites** | Check if you have all required software installed on your system. If not, download and install from the links provided in the README.md Requirements section. |
-| | **Verify installation by running:** |
-| | ```bash
-   php -v
-   composer --version
-   node -v
-   npm -v
-   ``` |
-| **2. Clone Repository** | Access the system's GitHub repository: |
-| | https://github.com/Purgatory69/SECUREDOCS.git |
-| | **Clone the repository:** |
-| | ```bash
-   cd directory-you-will-use
-   git clone https://github.com/Purgatory69/SECUREDOCS.git
-   cd SECUREDOCS
-   ``` |
-| **3. Copy Environment File** | Copy the localhost environment configuration file: |
-| | ```bash
-   cp .env.localhost .env
-   ``` |
-| | This file is pre-configured for local development at `http://localhost:8000` with all necessary settings for: |
-| | - Local database connection |
-| | - WebAuthn biometric login |
-| | - Email testing |
-| | - N8N integration |
-| | |
-| | ⚠️ **IMPORTANT:** Before continuing, read [DOCUMENTATION_INDEX.md](docs/setup-guides/DOCUMENTATION_INDEX.md) for complete API keys and configuration details. |
-| **3.5 Review Complete Guides** | **MUST READ:** [DOCUMENTATION_INDEX.md](docs/setup-guides/DOCUMENTATION_INDEX.md) |
-| | **This guide covers:** |
-| | - How to obtain API keys from all services |
-| | - Complete environment variable reference |
-| | - Creating service accounts (Supabase, Brevo, N8N, PayMongo, Bundlr) |
-| | - Production deployment configuration |
-| | |
-| | **Links to:** |
-| | - [QUICK_START.md](docs/setup-guides/QUICK_START.md) - Fast setup reference |
-| | - [LOCALHOST_SETUP.md](docs/setup-guides/LOCALHOST_SETUP.md) - Local development |
-| | - [N8N_SETUP_GUIDE.md](docs/setup-guides/N8N_SETUP_GUIDE.md) - N8N webhooks |
-| **4. Generate Application Key** | Generate the Laravel application encryption key: |
-| | ```bash
-   php artisan key:generate
-   ``` |
-| | This creates a unique key for your application instance and stores it in the `.env` file. |
-| **5. Install PHP Dependencies** | Open a terminal in the project directory and install PHP dependencies: |
-| | ```bash
-   composer install
-   ``` |
-| | This downloads and installs all required PHP packages defined in `composer.json`. |
-| **6. Install Node Dependencies** | Install Node.js dependencies: |
-| | ```bash
-   npm install
-   ``` |
-| | This downloads and installs all required JavaScript packages for frontend development. |
-| **7. Run Database Migrations** | Execute the database migrations: |
-| | ```bash
-   php artisan migrate
-   ``` |
-| | This sets up the PostgreSQL database schema using Supabase credentials from `.env`. |
-| **8. Build Frontend Assets** | Build the frontend assets for development: |
-| | ```bash
-   npm run build
-   ``` |
-| | This compiles TailwindCSS, JavaScript, and other frontend resources. |
+| **1. Verify Prerequisites** | Check if you have all required software installed on your system. If not, download and install from the links provided in the README.md Requirements section.<br><br>Verify installation by running:<br>`php -v`<br>`composer --version`<br>`node -v`<br>`npm -v` |
+| **2. Clone Repository** | Access the system's GitHub repository:<br>https://github.com/Purgatory69/SECUREDOCS.git<br><br>Clone the repository by typing these commands in a terminal:<br>`cd directory-you-will-use`<br>`git clone https://github.com/Purgatory69/SECUREDOCS.git`<br>`cd SECUREDOCS` |
+| **3. Copy Environment File** | Copy the localhost environment configuration file:<br>`cp .env.localhost .env`<br><br>This file is pre-configured for local development at `http://localhost:8000` with all necessary settings for:<br>- Local database connection<br>- WebAuthn biometric login<br>- Email testing<br>- N8N integration<br><br>⚠️ **IMPORTANT:** Before continuing, read [DOCUMENTATION_INDEX.md](docs/setup-guides/DOCUMENTATION_INDEX.md) for complete API keys and configuration details. |
+| **3.5 Review Complete Guides** | **MUST READ:** [DOCUMENTATION_INDEX.md](docs/setup-guides/DOCUMENTATION_INDEX.md)<br><br>This guide covers:<br>- How to obtain API keys from all services<br>- Complete environment variable reference<br>- Creating service accounts (Supabase, Brevo, N8N, PayMongo, Bundlr)<br>- Production deployment configuration<br><br>Links to:<br>- [QUICK_START.md](docs/setup-guides/QUICK_START.md) - Fast setup reference<br>- [LOCALHOST_SETUP.md](docs/setup-guides/LOCALHOST_SETUP.md) - Local development<br>- [N8N_SETUP_GUIDE.md](docs/setup-guides/N8N_SETUP_GUIDE.md) - N8N webhooks |
+| **4. Generate Application Key** | Generate the Laravel application encryption key:<br>`php artisan key:generate`<br><br>This creates a unique key for your application instance and stores it in the `.env` file. |
+| **5. Install PHP Dependencies** | Open a terminal in the project directory and install PHP dependencies:<br>`composer install`<br><br>This downloads and installs all required PHP packages defined in `composer.json`. |
+| **6. Install Node Dependencies** | In the same terminal, install Node.js dependencies:<br>`npm install`<br><br>This downloads and installs all required JavaScript packages for frontend development. |
+| **7. Run Database Migrations** | Execute the database migrations to create all required tables:<br>`php artisan migrate`<br><br>This sets up the PostgreSQL database schema using Supabase credentials from `.env`. |
+| **8. Build Frontend Assets** | Build the frontend assets for development:<br>`npm run build`<br><br>This compiles TailwindCSS, JavaScript, and other frontend resources. |
 | **9. Split Terminal & Start Servers** | Split the terminal in your IDE (VS Code: View > Terminal > Split Terminal) to run multiple servers simultaneously. |
-| **9.1 Terminal 1 - Laravel Server** | Run the Laravel development server: |
-| | ```bash
-   php artisan serve
-   ``` |
-| | This starts the backend server at `http://localhost:8000` |
-| **9.2 Terminal 2 - Frontend Dev Server** | Run the Vite development server: |
-| | ```bash
-   npm run dev
-   ``` |
-| | This starts the frontend development server with hot module replacement for real-time updates. |
-| **9.3 Terminal 3 - Queue Worker (Optional)** | Run the queue worker for background jobs: |
-| | ```bash
-   php artisan queue:work
-   ``` |
-| | This processes background tasks like email sending and file processing. |
-| **10. Access Application** | Open your web browser and navigate to: |
-| | `http://localhost:8000` |
-| | You should see the SecureDocs login page. Create an account and start using the application. |
+| | **Terminal 1 - Laravel Server:**<br>Run the Laravel development server:<br>`php artisan serve`<br><br>This starts the backend server at `http://localhost:8000` |
+| | **Terminal 2 - Frontend Dev Server:**<br>Run the Vite development server:<br>`npm run dev`<br><br>This starts the frontend development server with hot module replacement for real-time updates. |
+| | **Terminal 3 - Queue Worker (Optional):**<br>Run the queue worker for background jobs:<br>`php artisan queue:work`<br><br>This processes background tasks like email sending and file processing. |
+| **10. Access Application** | Open your web browser and navigate to:<br>`http://localhost:8000`<br><br>You should see the SecureDocs login page. Create an account and start using the application. |
 
 ---
 
