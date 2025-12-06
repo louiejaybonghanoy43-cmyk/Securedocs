@@ -387,7 +387,7 @@ For support and questions:
 
 - Laravel Framework - The foundation of this application
 - Supabase - Database and real-time features
-- Arweave/Pinata/Filecoin - Decentralized storage solutions
+- Arweave/Bundlr - Decentralized storage solutions
 - WebAuthn - Modern authentication standard
 
 ---
