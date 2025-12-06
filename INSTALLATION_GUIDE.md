@@ -8,7 +8,8 @@ The following is the step-by-step procedure to set up SecureDocs on your local m
 |------|-------------|
 | **1. Verify Prerequisites** | Check if you have all required software installed on your system. If not, download and install from the links provided in the README.md Requirements section.<br><br>Verify installation by running:<br>`php -v`<br>`composer --version`<br>`node -v`<br>`npm -v` |
 | **2. Clone Repository** | Access the system's GitHub repository:<br>https://github.com/Purgatory69/SECUREDOCS.git<br><br>Clone the repository by typing these commands in a terminal:<br>`cd directory-you-will-use`<br>`git clone https://github.com/Purgatory69/SECUREDOCS.git`<br>`cd SECUREDOCS` |
-| **3. Copy Environment File** | Copy the localhost environment configuration file:<br>`cp .env.localhost .env`<br><br>This file is pre-configured for local development at `http://localhost:8000` with all necessary settings for:<br>- Local database connection<br>- WebAuthn biometric login<br>- Email testing<br>- N8N integration |
+| **3. Copy Environment File** | Copy the localhost environment configuration file:<br>`cp .env.localhost .env`<br><br>This file is pre-configured for local development at `http://localhost:8000` with all necessary settings for:<br>- Local database connection<br>- WebAuthn biometric login<br>- Email testing<br>- N8N integration<br><br>⚠️ **IMPORTANT:** Before continuing, read [DOCUMENTATION_INDEX.md](docs/setup-guides/DOCUMENTATION_INDEX.md) for complete API keys and configuration details. |
+| **3.5 Review Complete Guides** | **MUST READ:** [DOCUMENTATION_INDEX.md](docs/setup-guides/DOCUMENTATION_INDEX.md)<br><br>This guide covers:<br>- How to obtain API keys from all services<br>- Complete environment variable reference<br>- Creating service accounts (Supabase, Brevo, N8N, PayMongo, Bundlr)<br>- Production deployment configuration<br><br>Links to:<br>- [ENV_KEYS_GUIDE.md](docs/setup-guides/ENV_KEYS_GUIDE.md) - Variable reference<br>- [SETUP_GUIDE_NEW_PC.md](docs/setup-guides/SETUP_GUIDE_NEW_PC.md) - Complete setup<br>- [N8N_SETUP_GUIDE.md](docs/setup-guides/N8N_SETUP_GUIDE.md) - N8N webhooks |
 | **4. Generate Application Key** | Generate the Laravel application encryption key:<br>`php artisan key:generate`<br><br>This creates a unique key for your application instance and stores it in the `.env` file. |
 | **5. Install PHP Dependencies** | Open a terminal in the project directory and install PHP dependencies:<br>`composer install`<br><br>This downloads and installs all required PHP packages defined in `composer.json`. |
 | **6. Install Node Dependencies** | In the same terminal, install Node.js dependencies:<br>`npm install`<br><br>This downloads and installs all required JavaScript packages for frontend development. |
@@ -88,6 +89,24 @@ This file includes:
 - WebAuthn settings for localhost
 - PayMongo test keys
 - All other necessary environment variables
+
+#### ⚠️ Important: API Keys & Configuration
+
+Before proceeding with the next steps, you **MUST** review the complete setup guides for detailed information about:
+- **API Keys & Credentials** - How to obtain and configure all external service keys
+- **Environment Variables** - Complete reference for all `.env` settings
+- **Service Accounts** - Creating accounts for Supabase, Brevo, N8N, PayMongo, Bundlr
+- **Production Deployment** - How to configure for production environments
+
+**👉 Read this first:** [DOCUMENTATION_INDEX.md](docs/setup-guides/DOCUMENTATION_INDEX.md)
+
+This guide will direct you to:
+- [ENV_KEYS_GUIDE.md](docs/setup-guides/ENV_KEYS_GUIDE.md) - Complete environment variable reference
+- [SETUP_GUIDE_NEW_PC.md](docs/setup-guides/SETUP_GUIDE_NEW_PC.md) - Detailed setup with all services
+- [N8N_SETUP_GUIDE.md](docs/setup-guides/N8N_SETUP_GUIDE.md) - N8N webhook configuration
+- [LOCALHOST_SETUP.md](docs/setup-guides/LOCALHOST_SETUP.md) - Local development details
+
+**Note:** The `.env.localhost` file has test/placeholder credentials. For production or to use real services, you'll need to obtain your own API keys from each service provider.
 
 ### Step 4: Generate Application Key
 
