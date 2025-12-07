@@ -74,6 +74,57 @@ php artisan queue:work
 
 ---
 
+## ⚠️ IMPORTANT: CORS Issue - Use `localhost:8000` NOT `127.0.0.1:8000`
+
+### The Problem
+
+If you access the app via `http://127.0.0.1:8000` instead of `http://localhost:8000`, you'll get CORS errors:
+
+```
+Access to script at 'http://localhost:8000/build/assets/app-D6TJVtCB.js' 
+from origin 'http://127.0.0.1:8000' has been blocked by CORS policy
+```
+
+### Why This Happens
+
+- Your app is accessed via `127.0.0.1:8000` (IP address)
+- But assets are loaded from `localhost:8000` (hostname)
+- Browsers treat these as **different origins** → CORS error
+- Assets won't load → Application breaks
+
+### The Solution
+
+**Always use:** `http://localhost:8000`
+
+**Never use:** `http://127.0.0.1:8000`
+
+### How to Fix If You Already Have CORS Errors
+
+1. **Clear browser cache:**
+   - Press `Ctrl + Shift + Delete`
+   - Clear all cache and cookies
+
+2. **Clear Laravel cache:**
+   ```bash
+   php artisan config:clear
+   php artisan cache:clear
+   ```
+
+3. **Restart your server:**
+   ```bash
+   php artisan serve
+   ```
+
+4. **Access the correct URL:**
+   - Go to `http://localhost:8000` (not 127.0.0.1)
+   - Refresh the page
+
+### Bookmark This
+
+To avoid confusion, bookmark: `http://localhost:8000`
+
+---
+
 ## 🔑 Key Differences from Production
 
 ### What Changed in .env.localhost
