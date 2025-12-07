@@ -546,6 +546,57 @@ IF (invalid)
 
 ---
 
+## 📥 Import Pre-Built Workflows (Quick Setup)
+
+Instead of manually creating workflows, you can import pre-built workflow files from the project:
+
+### Available Workflows
+
+The project includes ready-to-use N8N workflow files in the `n8n workflows/` folder:
+
+- **default chat bot.json** - Default chat webhook workflow
+- **premium workflow.json** - Premium chat and vectorization workflows
+
+### How to Import
+
+1. **In N8N Dashboard:**
+   - Click "New" → "Workflow"
+   - Click the three dots menu (⋯)
+   - Select "Import from file"
+
+2. **Select the Workflow File:**
+   - Navigate to `n8n workflows/` folder in the SecureDocs project
+   - Select either:
+     - `default chat bot.json` for basic chat functionality
+     - `premium workflow.json` for advanced features
+
+3. **Configure Imported Workflow:**
+   - Review the imported nodes
+   - Update API keys (OpenAI, etc.) if needed
+   - Verify webhook URLs
+   - Click "Save"
+   - Click "Activate" to enable
+
+4. **Get Webhook URLs:**
+   - After activation, copy the webhook URLs from each workflow
+   - Add them to your `.env` file
+
+### Benefits of Importing
+
+✅ **Faster Setup** - No need to manually create each node
+✅ **Pre-configured** - Nodes are already connected properly
+✅ **Error-free** - Tested workflow structure
+✅ **Best Practices** - Includes error handling and validation
+
+### Manual vs. Import
+
+- **Manual Creation** - Full control, learn how N8N works
+- **Import** - Quick setup, ready to use immediately
+
+Choose whichever approach works best for your needs!
+
+---
+
 ## ✅ Checklist
 
 - [ ] N8N account created
