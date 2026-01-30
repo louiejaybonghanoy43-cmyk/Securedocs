@@ -5,10 +5,15 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>SecureDocs</title>
 
-  <link rel="icon" type="image/x-icon" href="{{ asset('favicon.ico') }}" />
+  <link rel="icon" type="image/x-icon" href="/favicon.ico" />
   <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;700&display=swap" rel="stylesheet" />
   
-  @vite(['resources/css/app.css', 'resources/js/app.js'])
+  <!-- Static production asset links to avoid localhost URLs under Cloudflare Tunnel -->
+  <link rel="preload" as="style" href="/build/assets/app-Dt3GXNYa.css" />
+  <link rel="modulepreload" href="/build/assets/app-D6TJVtCB.js" />
+  <link rel="modulepreload" href="/build/assets/file-folder-v_uzNqzc.js" />
+  <link rel="stylesheet" href="/build/assets/app-Dt3GXNYa.css" data-navigate-track="reload" />
+  <script type="module" src="/build/assets/app-D6TJVtCB.js" data-navigate-track="reload"></script>
   <style>
     body { 
       font-family: 'Poppins', sans-serif; 

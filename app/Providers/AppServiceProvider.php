@@ -35,9 +35,17 @@ class AppServiceProvider extends ServiceProvider
             URL::forceScheme('https');
         }
 
+        $host = request()->header('X-Forwarded-Host', request()->getHost());
+        $rootUrl = 'https://' . $host;
+
+        config([
+            'app.url' => $rootUrl,
+            'app.asset_url' => $rootUrl,
+        ]);
+
         // Temporary debug to understand URL generation behind Cloudflare Tunnel
         Log::info('URL_DEBUG', [
-            'env_APP_URL' => env('APP_URL'),
+            // 'env_APP_URL' => env('APP_URL', 'https://securedocs.live'),
             'config_app_url' => config('app.url'),
             'config_asset_url' => config('app.asset_url'),
             'request_url' => request()->fullUrl(),
@@ -47,9 +55,7 @@ class AppServiceProvider extends ServiceProvider
             'x_forwarded_host' => request()->header('X-Forwarded-Host'),
         ]);
 
-        if (config('app.url')) {
-            URL::forceRootUrl(config('app.url'));
-        }
+        URL::forceRootUrl($rootUrl);
 
         // Ensure consistent domain usage (securedocs.live without www)
         if (app()->environment('production')) {
