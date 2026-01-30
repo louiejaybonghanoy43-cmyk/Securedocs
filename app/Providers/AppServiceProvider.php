@@ -35,6 +35,22 @@ class AppServiceProvider extends ServiceProvider
             URL::forceScheme('https');
         }
 
+        // Temporary debug to understand URL generation behind Cloudflare Tunnel
+        Log::info('URL_DEBUG', [
+            'env_APP_URL' => env('APP_URL'),
+            'config_app_url' => config('app.url'),
+            'config_asset_url' => config('app.asset_url'),
+            'request_url' => request()->fullUrl(),
+            'request_host' => request()->getHost(),
+            'request_scheme' => request()->getScheme(),
+            'x_forwarded_proto' => request()->header('X-Forwarded-Proto'),
+            'x_forwarded_host' => request()->header('X-Forwarded-Host'),
+        ]);
+
+        if (config('app.url')) {
+            URL::forceRootUrl(config('app.url'));
+        }
+
         // Ensure consistent domain usage (securedocs.live without www)
         if (app()->environment('production')) {
             URL::forceRootUrl('https://securedocs.live');
