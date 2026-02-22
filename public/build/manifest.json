@@ -1,0 +1,109 @@
+{
+  "_file-encryption-BFlBmmO2.js": {
+    "file": "assets/file-encryption-BFlBmmO2.js",
+    "name": "file-encryption"
+  },
+  "_file-folder-v_uzNqzc.js": {
+    "file": "assets/file-folder-v_uzNqzc.js",
+    "name": "file-folder",
+    "isDynamicEntry": true
+  },
+  "_vendor-DsVkTHo1.js": {
+    "file": "assets/vendor-DsVkTHo1.js",
+    "name": "vendor"
+  },
+  "resources/css/app.css": {
+    "file": "assets/app-Dt3GXNYa.css",
+    "src": "resources/css/app.css",
+    "isEntry": true
+  },
+  "resources/js/app.js": {
+    "file": "assets/app-D6TJVtCB.js",
+    "name": "app",
+    "src": "resources/js/app.js",
+    "isEntry": true,
+    "imports": [
+      "_file-folder-v_uzNqzc.js"
+    ]
+  },
+  "resources/js/dashboard.js": {
+    "file": "assets/dashboard-BqeFwGVB.js",
+    "name": "dashboard",
+    "src": "resources/js/dashboard.js",
+    "isEntry": true,
+    "imports": [
+      "_file-folder-v_uzNqzc.js",
+      "_file-encryption-BFlBmmO2.js",
+      "_vendor-DsVkTHo1.js"
+    ],
+    "dynamicImports": [
+      "_file-folder-v_uzNqzc.js"
+    ]
+  },
+  "resources/js/file-preview.js": {
+    "file": "assets/file-preview-DV8k9D9A.js",
+    "name": "file-preview",
+    "src": "resources/js/file-preview.js",
+    "isEntry": true
+  },
+  "resources/js/modules/blockchain-page.js": {
+    "file": "assets/blockchain-page--HlSUayh.js",
+    "name": "blockchain-page",
+    "src": "resources/js/modules/blockchain-page.js",
+    "isEntry": true,
+    "imports": [
+      "_file-folder-v_uzNqzc.js"
+    ]
+  },
+  "resources/js/modules/blockchain-upload.js": {
+    "file": "assets/blockchain-upload-HjuatYxa.js",
+    "name": "blockchain-upload",
+    "src": "resources/js/modules/blockchain-upload.js",
+    "isEntry": true
+  },
+  "resources/js/modules/blockchain.js": {
+    "file": "assets/blockchain-l0sNRNKZ.js",
+    "name": "blockchain",
+    "src": "resources/js/modules/blockchain.js",
+    "isEntry": true
+  },
+  "resources/js/modules/encrypted-arweave-upload.js": {
+    "file": "assets/encrypted-arweave-upload-CIInpWuH.js",
+    "name": "encrypted-arweave-upload",
+    "src": "resources/js/modules/encrypted-arweave-upload.js",
+    "isEntry": true,
+    "imports": [
+      "_file-encryption-BFlBmmO2.js"
+    ]
+  },
+  "resources/js/modules/encrypted-file-access.js": {
+    "file": "assets/encrypted-file-access-Dh5C8IVq.js",
+    "name": "encrypted-file-access",
+    "src": "resources/js/modules/encrypted-file-access.js",
+    "isEntry": true,
+    "imports": [
+      "_file-encryption-BFlBmmO2.js"
+    ]
+  },
+  "resources/js/modules/file-encryption.js": {
+    "file": "assets/file-encryption-Bt7YZZKr.js",
+    "name": "file-encryption",
+    "src": "resources/js/modules/file-encryption.js",
+    "isEntry": true
+  },
+  "resources/js/modules/file-folder.js": {
+    "file": "assets/file-folder-CBme-Egj.js",
+    "name": "file-folder",
+    "src": "resources/js/modules/file-folder.js",
+    "isEntry": true,
+    "imports": [
+      "_file-folder-v_uzNqzc.js"
+    ]
+  },
+  "resources/js/webauthn-handler.js": {
+    "file": "assets/webauthn-handler-bpGjg6LB.js",
+    "name": "webauthn-handler",
+    "src": "resources/js/webauthn-handler.js",
+    "isEntry": true
+  }
+}
